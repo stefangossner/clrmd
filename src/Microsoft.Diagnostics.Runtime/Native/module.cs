@@ -30,6 +30,7 @@ namespace Microsoft.Diagnostics.Runtime.Native
         public override string Name
         {
             get { return "default domain"; }
+            internal set { }
         }
 
         public override IList<ClrModule> Modules
@@ -145,41 +146,6 @@ namespace Microsoft.Diagnostics.Runtime.Native
         }
 
         public override Address AssemblyId
-        {
-            get { throw new NotImplementedException(); }
-        }
-
-        public override bool IsPdbLoaded
-        {
-            get { throw new NotImplementedException(); }
-        }
-
-        public override bool IsMatchingPdb(string pdbPath)
-        {
-            throw new NotImplementedException();
-        }
-
-        public override void LoadPdb(string path)
-        {
-            throw new NotImplementedException();
-        }
-
-        public override string TryDownloadPdb()
-        {
-            throw new NotImplementedException();
-        }
-
-        public override SourceLocation GetSourceInformation(uint token, int ilOffset)
-        {
-            throw new NotImplementedException();
-        }
-
-        public override SourceLocation GetSourceInformation(ClrMethod method, int ilOffset)
-        {
-            throw new NotImplementedException();
-        }
-
-        public override object PdbInterface
         {
             get { throw new NotImplementedException(); }
         }

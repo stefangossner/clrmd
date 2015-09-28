@@ -8,6 +8,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using Address = System.UInt64;
+using System.Linq;
 
 #pragma warning disable 649
 
@@ -26,6 +27,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
         protected CommonMethodTables _commonMTs;
         private Dictionary<Address, DesktopModule> _modules = new Dictionary<Address, DesktopModule>();
         private Dictionary<ulong, uint> _moduleSizes = null;
+        private ClrModule[] _moduleList = null;
         private Dictionary<string, DesktopModule> _moduleFiles = null;
         private DesktopAppDomain _system, _shared;
         private List<ClrAppDomain> _domains;
@@ -566,8 +568,13 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             if (_domains == null)
                 InitDomains();
 
-            foreach (var module in _modules.Values)
-                yield return module;
+            if (_moduleList == null)
+            {
+                HashSet<ClrModule> modules = new HashSet<ClrModule>(_modules.Values.Select(p=>(ClrModule)p));
+                _moduleList = modules.ToArray();
+            }
+
+            return _moduleList;
         }
 
         internal IEnumerable<ulong> EnumerateModules(IAppDomainData appDomain)
@@ -618,7 +625,10 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             }
 
             _system = InitDomain(ads.SystemDomain);
+            _system.Name = "System Domain";
+
             _shared = InitDomain(ads.SharedDomain);
+            _shared.Name = "Shared Domain";
 
             _moduleFiles = null;
             _moduleSizes = null;
@@ -775,7 +785,8 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
         internal ILToNativeMap[] GetILMap(Address ip)
         {
-            ILToNativeMap[] result = null;
+            List<ILToNativeMap> list = null;
+            ILToNativeMap[] tmp = null;
 
             ulong handle;
             int res = _dacInterface.StartEnumMethodInstancesByAddress(ip, null, out handle);
@@ -785,7 +796,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             object objMethod;
             res = _dacInterface.EnumMethodInstanceByAddress(ref handle, out objMethod);
 
-            if (res == 0)
+            while (res == 0)
             {
                 IXCLRDataMethodInstance method = (IXCLRDataMethodInstance)objMethod;
 
@@ -794,17 +805,45 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
                 if (res == 0)
                 {
-                    result = new ILToNativeMap[needed];
-                    res = method.GetILAddressMap(needed, out needed, result);
+                    tmp = new ILToNativeMap[needed];
+                    res = method.GetILAddressMap(needed, out needed, tmp);
+
+                    for (int i = 0; i < tmp.Length; i++)
+                    {
+                        // There seems to be a bug in IL to native mappings where a throw statement
+                        // may end up with an end address lower than the start address.  This is a
+                        // workaround for that issue.
+                        if (tmp[i].StartAddress > tmp[i].EndAddress)
+                        {
+                            if (i + 1 == tmp.Length)
+                                tmp[i].EndAddress = tmp[i].StartAddress + 0x20;
+                            else
+                                tmp[i].EndAddress = tmp[i + 1].StartAddress - 1;
+                        }
+                    }
 
                     if (res != 0)
-                        result = null;
+                        tmp = null;
                 }
 
-                _dacInterface.EndEnumMethodInstancesByAddress(handle);
+                res = _dacInterface.EnumMethodInstanceByAddress(ref handle, out objMethod);
+                if (res == 0 && tmp != null)
+                {
+                    if (list == null)
+                        list = new List<ILToNativeMap>();
+
+                    list.AddRange(tmp);
+                }
             }
 
-            return result;
+            if (list != null)
+            {
+                list.AddRange(tmp);
+                return list.ToArray();
+            }
+
+            _dacInterface.EndEnumMethodInstancesByAddress(handle);
+            return tmp;
         }
 
         #endregion

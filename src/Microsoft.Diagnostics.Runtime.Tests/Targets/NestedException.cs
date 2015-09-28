@@ -5,28 +5,30 @@ class Program
 {
     public static void Main(string[] args)
     {
-        Outer();
+        Foo foo = new Foo();
+        Outer();    /* seq */
+        GC.KeepAlive(foo);
     }
 
     private static void Outer()
     {
-        Middle();
+        Middle();    /* seq */
     }
 
     private static void Middle()
     {
-        Inner();
+        Inner();    /* seq */
     }
 
     private static void Inner()
     {
         try
         {
-            throw new FileNotFoundException("FNF Message");
+            throw new FileNotFoundException("FNF Message");    /* seq */
         }
         catch (FileNotFoundException e)
         {
-            throw new InvalidOperationException("IOE Message", e);
+            throw new InvalidOperationException("IOE Message", e);    /* seq */
         }
     }
 }

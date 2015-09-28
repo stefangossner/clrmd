@@ -46,8 +46,8 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             get { return DesktopVersion.v45; }
         }
 
-        ISOSHandleEnum _handleEnum;
-        List<ClrHandle> _handles;
+        private ISOSHandleEnum _handleEnum;
+        private List<ClrHandle> _handles;
 
         public override IEnumerable<ClrHandle> EnumerateHandles()
         {
@@ -76,11 +76,11 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
                 _handles = new List<ClrHandle>();
             }
-            
+
             // We already partially enumerated handles before, start with them.
             foreach (var handle in _handles)
                 yield return handle;
-            
+
             HandleData[] handles = new HandleData[8];
             uint fetched = 0;
             do
@@ -104,7 +104,6 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
                 for (int i = curr; i < _handles.Count; i++)
                     yield return _handles[i];
-
             } while (fetched > 0);
 
             _handleEnum = null;
@@ -225,26 +224,36 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                 return new ulong[0];
 
             int needed;
-            if (_sos.GetAssemblyList(appDomain, 0, null, out needed) < 0)
-                return null;
+            if (count <= 0)
+            {
+                if (_sos.GetAssemblyList(appDomain, 0, null, out needed) < 0)
+                    return new ulong[0];
 
-            ulong[] modules = new ulong[needed];
-            if (_sos.GetAssemblyList(appDomain, needed, modules, out needed) < 0)
-                return null;
+                count = needed;
+            }
+
+            // We ignore the return value here since modules might be partially
+            // filled even if GetAssemblyList hits an error.
+            ulong[] modules = new ulong[count];
+            _sos.GetAssemblyList(appDomain, modules.Length, modules, out needed);
 
             return modules;
         }
 
         internal override ulong[] GetModuleList(ulong assembly, int count)
         {
-            uint needed;
-            if (_sos.GetAssemblyModuleList(assembly, 0, null, out needed) < 0)
-                return null;
+            uint needed = (uint)count;
 
+            if (count <= 0)
+            {
+                if (_sos.GetAssemblyModuleList(assembly, 0, null, out needed) < 0)
+                    return new ulong[0];
+            }
+
+            // We ignore the return value here since modules might be partially
+            // filled even if GetAssemblyList hits an error.
             ulong[] modules = new ulong[needed];
-            if (_sos.GetAssemblyModuleList(assembly, needed, modules, out needed) < 0)
-                return null;
-
+            _sos.GetAssemblyModuleList(assembly, needed, modules, out needed);
             return modules;
         }
 
@@ -344,9 +353,16 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
         internal override IAppDomainData GetAppDomainData(ulong addr)
         {
-            LegacyAppDomainData data;
+            LegacyAppDomainData data = new LegacyAppDomainData(); ;
             if (_sos.GetAppDomainData(addr, out data) < 0)
-                return null;
+            {
+                // We can face an exception while walking domain data if we catch the process
+                // at a bad state.  As a workaround we will return partial data if data.Address
+                // and data.StubHeap are set.
+                if (data.Address != addr && data.StubHeap != 0)
+                    return null;
+            }
+
             return data;
         }
 

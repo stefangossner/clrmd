@@ -23,10 +23,7 @@ namespace Microsoft.Diagnostics.Runtime
         public HeapBase(RuntimeBase runtime)
         {
             _canWalkHeap = runtime.CanWalkHeap;
-            if (runtime.DataReader.CanReadAsync)
-                MemoryReader = new AsyncMemoryReader(runtime.DataReader, 0x10000);
-            else
-                MemoryReader = new MemoryReader(runtime.DataReader, 0x10000);
+            MemoryReader = new MemoryReader(runtime.DataReader, 0x10000);
             _pointerSize = runtime.PointerSize;
         }
 
@@ -196,7 +193,7 @@ namespace Microsoft.Diagnostics.Runtime
             {
                 // Start the segment search where you where last
                 int curIdx = _lastSegmentIdx;
-                for (;;)
+                for (; ;)
                 {
                     var segment = _segments[curIdx];
                     var offsetInSegment = (long)(objRef - segment.Start);

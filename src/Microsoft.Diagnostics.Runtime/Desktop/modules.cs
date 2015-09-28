@@ -4,16 +4,10 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Text.RegularExpressions;
 using Address = System.UInt64;
-using System.Text;
-using System.Collections;
 using System.IO;
-using System.Reflection;
-using Microsoft.Diagnostics.Runtime;
 using System.Runtime.InteropServices;
 using Microsoft.Diagnostics.Runtime.Utilities;
-using Dia2Lib;
 
 namespace Microsoft.Diagnostics.Runtime.Desktop
 {
@@ -45,80 +39,6 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
         private Address _address;
         private Address _assemblyAddress;
         private bool _typesLoaded;
-        private SymbolModule _symbols;
-        private PEFile _peFile;
-
-
-        public override SourceLocation GetSourceInformation(ClrMethod method, int ilOffset)
-        {
-            if (method == null)
-                throw new ArgumentNullException("method");
-
-            if (method.Type != null && method.Type.Module != this)
-                throw new InvalidOperationException("Method not in this module.");
-
-            return GetSourceInformation(method.MetadataToken, ilOffset);
-        }
-
-        public override SourceLocation GetSourceInformation(uint token, int ilOffset)
-        {
-            if (_symbols == null)
-                return null;
-
-            return _symbols.SourceLocationForManagedCode(token, ilOffset);
-        }
-
-        public override bool IsPdbLoaded { get { return _symbols != null; } }
-
-        public override bool IsMatchingPdb(string pdbPath)
-        {
-            if (_peFile == null)
-                _peFile = new PEFile(new ReadVirtualStream(_runtime.DataReader, (long)_imageBase, (long)_size), true);
-
-            string pdbName;
-            Guid pdbGuid;
-            int rev;
-            if (!_peFile.GetPdbSignature(out pdbName, out pdbGuid, out rev))
-                throw new ClrDiagnosticsException("Failed to get PDB signature from module.", ClrDiagnosticsException.HR.DataRequestError);
-
-            //todo: fix/release
-            IDiaDataSource source = DiaLoader.GetDiaSourceObject();
-            IDiaSession session;
-            source.loadDataFromPdb(pdbPath);
-            source.openSession(out session);
-            return pdbGuid == session.globalScope.guid;
-        }
-
-        public override void LoadPdb(string path)
-        {
-            _symbols = _runtime.DataTarget.FileLoader.LoadPdb(path);
-        }
-
-
-        public override object PdbInterface
-        {
-            get
-            {
-                if (_symbols == null)
-                    return null;
-
-                return _symbols.Session;
-            }
-        }
-
-        public override string TryDownloadPdb()
-        {
-            var dataTarget = _runtime.DataTarget;
-
-            string pdbName;
-            Guid pdbGuid;
-            int rev;
-            if (!_peFile.GetPdbSignature(out pdbName, out pdbGuid, out rev))
-                throw new ClrDiagnosticsException("Failed to get PDB signature from module.", ClrDiagnosticsException.HR.DataRequestError);
-
-            return _runtime.DataTarget.SymbolLocator.FindPdb(pdbName, pdbGuid, rev);
-        }
-
 
         public DesktopModule(DesktopRuntimeBase runtime, ulong address, IModuleData data, string name, string assemblyName, ulong size)
         {
@@ -137,10 +57,30 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             _address = address;
             _size = size;
 
-            // This is very expensive in the minidump case, as we may be heading out to the symbol server or
-            // reading multiple files from disk. Only optimistically fetch this data if we have full memory.
             if (!runtime.DataReader.IsMinidump)
+            {
+                // This is very expensive in the minidump case, as we may be heading out to the symbol server or
+                // reading multiple files from disk. Only optimistically fetch this data if we have full memory.
                 _metadata = data.LegacyMetaDataImport as IMetadata;
+            }
+            else
+            {
+                // If we are a minidump and metadata isn't mapped in, attempt to fetch this module from the symbol server
+                // on a background thread.
+#if !V2_SUPPORT
+                if (_isPE && _metadataStart != 0 && _metadataLength > 0)
+                {
+                    int read;
+                    byte[] tmp = new byte[1];
+                    if (!_runtime.DataReader.ReadMemory(_metadataStart, tmp, 1, out read) || read == 0)
+                    {
+                        int filesize, imagesize;
+                        if (PEFile.TryGetIndexProperties(new ReadVirtualStream(_runtime.DataReader, (long)data.ImageBase, (long)size), true, out imagesize, out filesize))
+                            _runtime.DataTarget.SymbolLocator.PrefetchBinary(Path.GetFileName(assemblyName), imagesize, filesize);
+                    }
+                }
+#endif
+            }
         }
 
         public override IEnumerable<ClrType> EnumerateTypes()
@@ -415,40 +355,6 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
         public override Address AssemblyId
         {
             get { return _id; }
-        }
-
-        public override bool IsPdbLoaded
-        {
-            get { return false; }
-        }
-
-        public override bool IsMatchingPdb(string pdbPath)
-        {
-            return false;
-        }
-
-        public override void LoadPdb(string path)
-        {
-        }
-
-        public override object PdbInterface
-        {
-            get { return null; }
-        }
-
-        public override string TryDownloadPdb()
-        {
-            return null;
-        }
-
-        public override SourceLocation GetSourceInformation(uint token, int ilOffset)
-        {
-            return null;
-        }
-
-        public override SourceLocation GetSourceInformation(ClrMethod method, int ilOffset)
-        {
-            return null;
         }
     }
 }

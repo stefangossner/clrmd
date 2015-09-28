@@ -118,9 +118,9 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
     /// </summary>
     public partial class DefaultSymbolLocator : SymbolLocator
     {
-        static Dictionary<PdbEntry, Task<string>> s_pdbs = new Dictionary<PdbEntry, Task<string>>();
-        static Dictionary<FileEntry, Task<string>> s_files = new Dictionary<FileEntry, Task<string>>();
-        static Dictionary<string, Task> s_copy = new Dictionary<string, Task>(StringComparer.OrdinalIgnoreCase);
+        private static Dictionary<PdbEntry, Task<string>> s_pdbs = new Dictionary<PdbEntry, Task<string>>();
+        private static Dictionary<FileEntry, Task<string>> s_files = new Dictionary<FileEntry, Task<string>>();
+        private static Dictionary<string, Task> s_copy = new Dictionary<string, Task>(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>
         /// Attempts to locate a binary via the symbol server.  This function will then copy the file
@@ -150,7 +150,7 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
                 if (!s_files.TryGetValue(fileEntry, out task))
                     task = s_files[fileEntry] = DownloadFileWorker(fileName, simpleFilename, buildTimeStamp, imageSize, checkProperties);
             }
-            
+
             // If we failed to find the file, we need to clear out the empty task, since the user could
             // change symbol paths and we need s_files to only contain positive results.
             string result = await task;
@@ -219,7 +219,7 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
             string result = CheckLocalPaths(pdbFullPath, pdbSimpleName, cachePath, match);
             if (result != null)
                 return result;
-            
+
             result = await SearchSymbolServerForFile(pdbSimpleName, pdbIndexPath, match);
             return result;
         }
@@ -232,8 +232,11 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
             Func<string, bool> match = (file) => ValidateBinary(file, buildTimeStamp, imageSize, checkProperties);
             string result = CheckLocalPaths(fileFullPath, fileSimpleName, cachePath, match);
             if (result != null)
+            {
+                Trace("Found '{0}' locally on path '{1}'.", fileSimpleName, result);
                 return result;
-            
+            }
+
             result = await SearchSymbolServerForFile(fileSimpleName, fileIndexPath, match);
             return result;
         }
@@ -291,7 +294,7 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
             {
                 using (Stream stream = File.OpenRead(sourcePath))
                     await CopyStreamToFileAsync(stream, sourcePath, fullDestPath, stream.Length);
-                
+
                 return fullDestPath;
             }
             catch (Exception e)
@@ -321,7 +324,7 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
             // Last, check for a redirection link.
             string filePtrSigPath = Path.Combine(Path.GetDirectoryName(fileIndexPath), "file.ptr");
             Task<string> filePtrDownload = GetPhysicalFileFromServerAsync(urlForServer, filePtrSigPath, fullDestPath, returnContents: true);
-            
+
 
             // Handle compressed download.
             string result = await compressedFilePathDownload;
@@ -368,11 +371,11 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
                     Trace("Error copying from file.ptr: content '{0}' from '{1}' to '{2}'.", filePtrData, filePtrSigPath, fullDestPath);
                 }
             }
-            else
+            else if (!string.IsNullOrWhiteSpace(filePtrData))
             {
                 Trace("Error resolving file.ptr: content '{0}' from '{1}'.", filePtrData, filePtrSigPath);
             }
-            
+
             return null;
         }
 
@@ -380,7 +383,7 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
         {
             if (string.IsNullOrEmpty(serverPath))
                 return null;
-            
+
             if (File.Exists(fullDestPath))
             {
                 if (returnContents)
@@ -405,6 +408,7 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
 
                         Directory.CreateDirectory(Path.GetDirectoryName(fullDestPath));
                         await CopyStreamToFileAsync(fromStream, fullUri, fullDestPath, response.ContentLength);
+                        Trace("Found '{0}' at '{1}'.  Copied to '{2}'.", Path.GetFileName(fileIndexPath), fullUri, fullDestPath);
                         return fullDestPath;
                     }
                 }
@@ -463,7 +467,7 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
             lock (entries)
                 return entries.Contains(entry);
         }
-        
+
 
         /// <summary>
         /// Copies the given file from the input stream into fullDestPath.
@@ -581,7 +585,6 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
                         Task<string> task = new Task<string>(() => value);
                         s_pdbs[entry] = task;
                         task.Start();
-
                     }
                 }
             }
@@ -591,10 +594,15 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
                     missing.Add(entry);
             }
         }
+
+        internal override void PrefetchBinary(string name, int timestamp, int imagesize)
+        {
+            new Task(async () => await FindBinaryAsync(name, timestamp, imagesize, true)).Start();
+        }
     }
 
 
-    static class AsyncHelpers
+    internal static class AsyncHelpers
     {
         public static async Task<T> GetFirstNonNullResult<T>(this List<Task<T>> tasks) where T : class
         {
