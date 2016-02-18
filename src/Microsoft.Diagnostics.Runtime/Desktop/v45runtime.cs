@@ -289,6 +289,15 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             return data;
         }
 
+        internal override ulong GetMethodTableByEEClass(ulong eeclass)
+        {
+            ulong value;
+            if (_sos.GetMethodTableForEEClass(eeclass, out value) != 0)
+                return 0;
+
+            return value;
+        }
+
         internal override IGCInfo GetGCInfo()
         {
             LegacyGCInfo gcInfo;
@@ -465,13 +474,14 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             return data;
         }
 
-        internal override IMetadata GetMetadataImport(ulong module)
+        internal override ICorDebug.IMetadataImport GetMetadataImport(ulong module)
         {
             object obj = null;
             if (module == 0 || _sos.GetModule(module, out obj) < 0)
                 return null;
 
-            return obj as IMetadata;
+            RegisterForRelease(obj);
+            return obj as ICorDebug.IMetadataImport;
         }
 
         internal override IObjectData GetObjectData(ulong objRef)
@@ -482,14 +492,14 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             return data;
         }
 
-        internal override IList<ulong> GetMethodTableList(ulong module)
+        internal override IList<MethodTableTokenPair> GetMethodTableList(ulong module)
         {
-            List<ulong> mts = new List<ulong>();
+            List<MethodTableTokenPair> mts = new List<MethodTableTokenPair>();
             int res = _sos.TraverseModuleMap(0, module, new ModuleMapTraverse(delegate (uint index, ulong mt, IntPtr token)
-                { mts.Add(mt); }),
+                { mts.Add(new MethodTableTokenPair(mt, index)); }),
                 IntPtr.Zero);
 
-            return (res < 0) ? null : mts;
+            return mts;
         }
 
         internal override IDomainLocalModuleData GetDomainLocalModule(ulong appDomain, ulong id)
@@ -617,7 +627,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             return data.token;
         }
 
-        protected override DesktopStackFrame GetStackFrame(int res, ulong ip, ulong framePtr, ulong frameVtbl)
+        protected override DesktopStackFrame GetStackFrame(DesktopThread thread, int res, ulong ip, ulong framePtr, ulong frameVtbl)
         {
             DesktopStackFrame frame;
             StringBuilder sb = new StringBuilder();
@@ -638,18 +648,18 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                         innerMethod = DesktopMethod.Create(this, mdData);
                 }
 
-                frame = new DesktopStackFrame(this, framePtr, frameName, innerMethod);
+                frame = new DesktopStackFrame(this, thread, framePtr, frameName, innerMethod);
             }
             else
             {
                 ulong md;
                 if (_sos.GetMethodDescPtrFromIP(ip, out md) >= 0)
                 {
-                    frame = new DesktopStackFrame(this, ip, framePtr, md);
+                    frame = new DesktopStackFrame(this, thread, ip, framePtr, md);
                 }
                 else
                 {
-                    frame = new DesktopStackFrame(this, ip, framePtr, 0);
+                    frame = new DesktopStackFrame(this, thread, ip, framePtr, 0);
                 }
             }
 
@@ -707,6 +717,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             // Skip size and header
             dataPtr += (ulong)(IntPtr.Size * 2);
 
+            DesktopThread thread = null;
             for (int i = 0; i < (int)count; ++i)
             {
                 ulong ip, sp, md;
@@ -717,7 +728,10 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                 if (!ReadPointer(dataPtr + (ulong)(2 * IntPtr.Size), out md))
                     break;
 
-                result.Add(new DesktopStackFrame(this, ip, sp, md));
+                if (i == 0)
+                    thread = (DesktopThread)GetThreadByStackAddress(sp);
+
+                result.Add(new DesktopStackFrame(this, thread, ip, sp, md));
 
                 dataPtr += (ulong)elementSize;
             }

@@ -226,9 +226,22 @@ namespace Microsoft.Diagnostics.Runtime
     public abstract class ClrType
     {
         /// <summary>
-        /// The index of this type.
+        /// Retrieves the first type handle in EnumerateMethodTables().  MethodTables
+        /// are unique to an AppDomain/Type pair, so when there are multiple domains
+        /// there will be multiple MethodTable for a class.
         /// </summary>
-        abstract public int Index { get; }
+        abstract public ulong MethodTable { get; }
+
+        /// <summary>
+        /// Enumerates all MethodTable for this type in the process.  MethodTable
+        /// are unique to an AppDomain/Type pair, so when there are multiple domains
+        /// there may be multiple MethodTable.  Note that even if a type could be
+        /// used in an AppDomain, that does not mean we actually have a MethodTable
+        /// if the type hasn't been created yet.
+        /// </summary>
+        /// <returns>An enumeration of MethodTable in the process for this given
+        /// type.</returns>
+        abstract public IEnumerable<ulong> EnumerateMethodTables();
 
         /// <summary>
         /// Returns the metadata token of this type.
@@ -291,6 +304,13 @@ namespace Microsoft.Diagnostics.Runtime
         /// Returns the module this type is defined in.
         /// </summary>
         virtual public ClrModule Module { get { return null; } }
+
+        /// <summary>
+        /// Returns a method based on its token.
+        /// </summary>
+        /// <param name="token">The token of the method to return.</param>
+        /// <returns>A ClrMethod for the given token, null if no such methodDesc exists.</returns>
+        internal virtual ClrMethod GetMethod(uint token) { return null; }
 
         /// <summary>
         /// Returns the ElementType of this Type.  Can return ELEMENT_TYPE_VOID on error.
@@ -410,20 +430,6 @@ namespace Microsoft.Diagnostics.Runtime
         abstract public ClrStaticField GetStaticFieldByName(string name);
 
         /// <summary>
-        /// Convenience function which dereferences fields.  For example, if you wish to dereference m_foo.m_bar.m_baz, you can pass:
-        /// { "m_foo", "m_bar", "m_baz" } into this function's second parameter to dereference those fields to get the value.
-        /// Throws Exception if a field you expect does not exist.
-        /// </summary>
-        [Obsolete("This method will be removed 1.0 RTM, you will need to reimplement it if you use it.")]
-        virtual public object GetFieldValue(Address obj, ICollection<string> fields) { throw new NotImplementedException(); }
-
-        /// <summary>
-        /// Same as GetFieldValue but returns true on success, false on failure, and does not throw.
-        /// </summary>
-        [Obsolete("This method will be removed 1.0 RTM, you will need to reimplement it if you use it.")]
-        virtual public bool TryGetFieldValue(Address obj, ICollection<string> fields, out object value) { value = null; return false; }
-
-        /// <summary>
         /// If this type inherits from another type, this is that type.  Can return null if it does not inherit (or is unknown)
         /// </summary>
         abstract public ClrType BaseType { get; }
@@ -476,13 +482,6 @@ namespace Microsoft.Diagnostics.Runtime
         /// that whose children are not statically known by just knowing the type.  
         /// </summary>
         virtual public bool IsArray { get { return false; } }
-
-        // If the type has dynamic elements (it is an array) this describes them.  
-        /// <summary>
-        /// Gets the type of the elements in the array.  
-        /// </summary>
-        [Obsolete("Use ComponentType instead.")]
-        virtual public ClrType ArrayComponentType { get { return ComponentType; } internal set { ComponentType = value; } }
 
         /// <summary>
         /// If the type is an array, then GetArrayLength returns the number of elements in the array.  Undefined
@@ -596,7 +595,7 @@ namespace Microsoft.Diagnostics.Runtime
         /// <returns>A string representation of this object.</returns>
         public override string ToString()
         {
-            return string.Format("HeapType {0}", Name);
+            return Name;
         }
     }
 
@@ -626,19 +625,19 @@ namespace Microsoft.Diagnostics.Runtime
         /// Returns true if this field is a primitive (int, float, etc), false otherwise.
         /// </summary>
         /// <returns>True if this field is a primitive (int, float, etc), false otherwise.</returns>
-        virtual public bool IsPrimitive() { return ClrRuntime.IsPrimitive(ElementType); }
+        virtual public bool IsPrimitive { get { return ClrRuntime.IsPrimitive(ElementType); } }
 
         /// <summary>
         /// Returns true if this field is a ValueClass (struct), false otherwise.
         /// </summary>
         /// <returns>True if this field is a ValueClass (struct), false otherwise.</returns>
-        virtual public bool IsValueClass() { return ClrRuntime.IsValueClass(ElementType); }
+        virtual public bool IsValueClass { get { return ClrRuntime.IsValueClass(ElementType); } }
 
         /// <summary>
         /// Returns true if this field is an object reference, false otherwise.
         /// </summary>
         /// <returns>True if this field is an object reference, false otherwise.</returns>
-        virtual public bool IsObjectReference() { return ClrRuntime.IsObjectReference(ElementType); }
+        virtual public bool IsObjectReference { get { return ClrRuntime.IsObjectReference(ElementType); } }
 
         /// <summary>
         /// Gets the size of this field.
@@ -695,43 +694,6 @@ namespace Microsoft.Diagnostics.Runtime
     /// </summary>
     public abstract class ClrInstanceField : ClrField
     {
-        /// <summary>
-        /// Obsolete.
-        /// </summary>
-        [Obsolete("Use GetValue instead.")]
-        virtual public object GetFieldValue(Address objRef)
-        {
-            return GetValue(objRef, false);
-        }
-
-        /// <summary>
-        /// Obsolete.
-        /// </summary>
-        [Obsolete("Use GetValue instead.")]
-        virtual public object GetFieldValue(Address objRef, bool interior)
-        {
-            return GetValue(objRef, interior);
-        }
-
-        /// <summary>
-        /// Obsolete.
-        /// </summary>
-        [Obsolete("Use GetAddress instead.")]
-        virtual public Address GetFieldAddress(Address objRef)
-        {
-            return GetAddress(objRef, false);
-        }
-
-        /// <summary>
-        /// Obsolete.
-        /// </summary>
-        [Obsolete("Use GetAddress instead.")]
-        virtual public Address GetFieldAddress(Address objRef, bool interior)
-        {
-            return GetAddress(objRef, false);
-        }
-
-
         /// <summary>
         /// Returns the value of this field.  Equivalent to GetFieldValue(objRef, false).
         /// </summary>
@@ -794,24 +756,6 @@ namespace Microsoft.Diagnostics.Runtime
     public abstract class ClrStaticField : ClrField
     {
         /// <summary>
-        /// Obsolete.
-        /// </summary>
-        [Obsolete("Use GetValue instead.")]
-        virtual public object GetFieldValue(ClrAppDomain domain)
-        {
-            return GetValue(domain);
-        }
-
-        /// <summary>
-        /// Obsolete.
-        /// </summary>
-        [Obsolete("Use GetAddress instead.")]
-        virtual public Address GetFieldAddress(ClrAppDomain domain)
-        {
-            return GetAddress(domain);
-        }
-
-        /// <summary>
         /// Returns whether this static field has been initialized in a particular AppDomain
         /// or not.  If a static variable has not been initialized, then its class constructor
         /// may have not been run yet.  Calling GetFieldValue on an uninitialized static
@@ -865,25 +809,6 @@ namespace Microsoft.Diagnostics.Runtime
     /// </summary>
     public abstract class ClrThreadStaticField : ClrField
     {
-        /// <summary>
-        /// Obsolete.
-        /// </summary>
-        [Obsolete("Use GetValue instead.")]
-        virtual public object GetFieldValue(ClrAppDomain domain, ClrThread thread)
-        {
-            return GetValue(domain, thread);
-        }
-
-        /// <summary>
-        /// Obsolete.
-        /// </summary>
-        [Obsolete("Use GetAddress instead.")]
-        virtual public Address GetFieldAddress(ClrAppDomain domain, ClrThread thread)
-        {
-            return GetAddress(domain, thread);
-        }
-
-
         /// <summary>
         /// Gets the value of the field.
         /// </summary>
@@ -1077,6 +1002,23 @@ namespace Microsoft.Diagnostics.Runtime
     public abstract class ClrMethod
     {
         /// <summary>
+        /// Retrieves the first MethodDesc in EnumerateMethodDescs().  For single
+        /// AppDomain programs this is the only MethodDesc.  MethodDescs
+        /// are unique to an Method/AppDomain pair, so when there are multiple domains
+        /// there will be multiple MethodDescs for a method.
+        /// </summary>
+        abstract public ulong MethodDesc { get; }
+
+        /// <summary>
+        /// Enumerates all method descs for this method in the process.  MethodDescs
+        /// are unique to an Method/AppDomain pair, so when there are multiple domains
+        /// there will be multiple MethodDescs for a method.
+        /// </summary>
+        /// <returns>An enumeration of method handles in the process for this given
+        /// method.</returns>
+        abstract public IEnumerable<ulong> EnumerateMethodDescs();
+
+        /// <summary>
         /// The name of the method.  For example, "void System.Foo.Bar(object o, int i)" would return "Bar".
         /// </summary>
         abstract public string Name { get; }
@@ -1091,14 +1033,6 @@ namespace Microsoft.Diagnostics.Runtime
         /// Returns the instruction pointer in the target process for the start of the method's assembly.
         /// </summary>
         abstract public Address NativeCode { get; }
-
-        /// <summary>
-        /// Returns the file and line number for the given offset in the method.
-        /// </summary>
-        /// <param name="nativeOffset">The offset within the method (not the address in memory) of the instruction pointer.</param>
-        /// <returns>The file and line number for the given offset.</returns>
-        [Obsolete("Use Microsoft.Diagnostics.Utilities.Pdb")]
-        virtual public SourceLocation GetSourceLocationForOffset(Address nativeOffset) { return null; }
 
         /// <summary>
         /// Gets the ILOffset of the given address within this method.

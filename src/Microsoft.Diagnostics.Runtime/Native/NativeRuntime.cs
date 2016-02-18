@@ -31,6 +31,11 @@ namespace Microsoft.Diagnostics.Runtime.Native
                 throw new ClrDiagnosticsException("Unsupported dac version.", ClrDiagnosticsException.HR.DacError);
         }
 
+        public override ClrMethod GetMethodByHandle(ulong methodHandle)
+        {
+            return null;
+        }
+
         protected override void InitApi()
         {
             if (_sos == null)
@@ -46,17 +51,7 @@ namespace Microsoft.Diagnostics.Runtime.Native
         public override ClrHeap GetHeap()
         {
             if (_heap == null)
-                _heap = new NativeHeap(this, NativeModules, null);
-
-            return _heap;
-        }
-
-        public override ClrHeap GetHeap(System.IO.TextWriter log)
-        {
-            if (_heap == null)
-                _heap = new NativeHeap(this, NativeModules, log);
-            else
-                _heap.Log = log;
+                _heap = new NativeHeap(this, NativeModules);
 
             return _heap;
         }
@@ -121,17 +116,13 @@ namespace Microsoft.Diagnostics.Runtime.Native
             OnRuntimeFlushed();
             throw new NotImplementedException();
         }
-
-        internal override IEnumerable<ClrStackFrame> EnumerateStackFrames(uint osThreadId)
-        {
-            throw new NotImplementedException();
-        }
+        
         override public ClrThreadPool GetThreadPool() { throw new NotImplementedException(); }
 
         internal ClrAppDomain GetRhAppDomain()
         {
             if (_domain == null)
-                _domain = new NativeAppDomain(NativeModules);
+                _domain = new NativeAppDomain(this, NativeModules);
 
             return _domain;
         }
@@ -261,7 +252,7 @@ namespace Microsoft.Diagnostics.Runtime.Native
             IThreadData thread = GetThread(tsData.FirstThread);
             for (int i = 0; thread != null; i++)
             {
-                threads.Add(new DesktopThread(this, thread, addr, tsData.Finalizer == addr));
+                threads.Add(new NativeThread(this, thread, addr, tsData.Finalizer == addr));
 
                 addr = thread.Next;
                 thread = GetThread(addr);
@@ -395,12 +386,15 @@ namespace Microsoft.Diagnostics.Runtime.Native
             throw new NotImplementedException();
         }
 
-        public override IEnumerable<ClrModule> EnumerateModules()
+        public override IList<ClrModule> Modules
         {
-            throw new NotImplementedException();
+            get
+            {
+                throw new NotImplementedException();
+            }
         }
 
-        public override CcwData GetCcwDataFromAddress(Address addr)
+        public override CcwData GetCcwDataByAddress(Address addr)
         {
             throw new NotImplementedException();
         }

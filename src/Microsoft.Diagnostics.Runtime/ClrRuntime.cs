@@ -77,8 +77,14 @@ namespace Microsoft.Diagnostics.Runtime
         /// Enumerates all objects currently on the finalizer queue.  (Not finalizable objects, but objects
         /// which have been collected and will be imminently finalized.)
         /// </summary>
-        abstract public IEnumerable<Address> EnumerateFinalizerQueue();
+        abstract public IEnumerable<Address> EnumerateFinalizerQueueObjectAddresses();
 
+        /// <summary>
+        /// Returns a ClrMethod by its internal runtime handle (on desktop CLR this is a MethodDesc).
+        /// </summary>
+        /// <param name="methodHandle">The method handle (MethodDesc) to look up.</param>
+        /// <returns>The ClrMethod for the given method handle, or null if no method was found.</returns>
+        abstract public ClrMethod GetMethodByHandle(Address methodHandle);
 
         /// <summary>
         /// Returns the CCW data associated with the given address.  This is used when looking at stowed
@@ -86,19 +92,7 @@ namespace Microsoft.Diagnostics.Runtime
         /// </summary>
         /// <param name="addr">The address of the CCW obtained from stowed exception data.</param>
         /// <returns>The CcwData describing the given CCW, or null.</returns>
-        public abstract CcwData GetCcwDataFromAddress(ulong addr);
-
-        /// <summary>
-        /// Read data out of the target process.
-        /// </summary>
-        /// <param name="address">The address to start the read from.</param>
-        /// <param name="buffer">The buffer to write memory to.</param>
-        /// <param name="bytesRequested">How many bytes to read (must be less than/equal to buffer.Length)</param>
-        /// <param name="bytesRead">The number of bytes actually read out of the process.  This will be less than
-        /// bytes requested if the request falls off the end of an allocation.</param>
-        /// <returns>False if the memory is not readable (free or no read permission), true if *some* memory was read.</returns>
-        [Obsolete("Use ReadMemory instead.")]
-        abstract public bool ReadVirtual(Address address, byte[] buffer, int bytesRequested, out int bytesRead);
+        public abstract CcwData GetCcwDataByAddress(ulong addr);
 
 
         /// <summary>
@@ -135,12 +129,6 @@ namespace Microsoft.Diagnostics.Runtime
         abstract public ClrHeap GetHeap();
 
         /// <summary>
-        /// Gets the GC heap of the process.
-        /// </summary>
-        [Obsolete]
-        abstract public ClrHeap GetHeap(TextWriter diagnosticLog);
-
-        /// <summary>
         /// Returns data on the CLR thread pool for this runtime.
         /// </summary>
         virtual public ClrThreadPool GetThreadPool() { throw new NotImplementedException(); }
@@ -159,11 +147,11 @@ namespace Microsoft.Diagnostics.Runtime
         /// </summary>
         abstract public ClrMethod GetMethodByAddress(Address ip);
 
+
         /// <summary>
-        /// Enumerates all modules in the process.
+        /// A list of all modules loaded into the process.
         /// </summary>
-        /// <returns>An enumeration of modules.</returns>
-        public abstract IEnumerable<ClrModule> EnumerateModules();
+        public abstract IList<ClrModule> Modules { get; }
 
         /// <summary>
         /// Flushes the dac cache.  This function MUST be called any time you expect to call the same function
@@ -195,6 +183,28 @@ namespace Microsoft.Diagnostics.Runtime
             var evt = RuntimeFlushed;
             if (evt != null)
                 evt(this);
+        }
+
+        /// <summary>
+        /// Whether or not the runtime has component method tables for arrays.  This is an extra field in
+        /// array objects on the heap, which was removed in v4.6 of desktop clr.
+        /// </summary>
+        internal bool HasArrayComponentMethodTables
+        {
+            get
+            {
+                if (ClrInfo.Flavor == ClrFlavor.Desktop)
+                {
+                    VersionInfo version = ClrInfo.Version;
+                    if (version.Major > 4)
+                        return false;
+
+                    if (version.Major == 4 && version.Minor >= 6)
+                        return false;
+                }
+
+                return true;
+            }
         }
 
         internal static bool IsPrimitive(ClrElementType cet)
@@ -470,18 +480,6 @@ namespace Microsoft.Diagnostics.Runtime
         /// The the type of the Object.
         /// </summary>
         public ClrType Type { get; set; }
-
-        /// <summary>
-        /// Whether the handle is strong (roots the object) or not.
-        /// </summary>
-        [Obsolete("Use IsStrong instead.")]
-        public bool Strong
-        {
-            get
-            {
-                return IsStrong;
-            }
-        }
 
         /// <summary>
         /// Whether the handle is strong (roots the object) or not.
@@ -802,6 +800,18 @@ namespace Microsoft.Diagnostics.Runtime
         protected IDataReader _dataReader;
         protected DataTargetImpl _dataTarget;
 
+        protected ICorDebug.ICorDebugProcess _corDebugProcess;
+        internal ICorDebug.ICorDebugProcess CorDebugProcess
+        {
+            get
+            {
+                if (_corDebugProcess == null)
+                    _corDebugProcess = ICorDebug.CLRDebugging.CreateICorDebugProcess(ClrInfo.ModuleInfo.ImageBase, _library.DacDataTarget, _dataTarget.FileLoader);
+
+                return _corDebugProcess;
+            }
+        }
+
         public RuntimeBase(ClrInfo info, DataTargetImpl dataTarget, DacLibrary lib)
         {
             Debug.Assert(lib != null);
@@ -828,6 +838,17 @@ namespace Microsoft.Diagnostics.Runtime
         public override DataTarget DataTarget
         {
             get { return _dataTarget; }
+        }
+
+        public void RegisterForRelease(object o)
+        {
+            if (o != null)
+                _library.AddToReleaseList(o);
+        }
+
+        public void RegisterForRelease(IModuleData module)
+        {
+            RegisterForRelease(module?.LegacyMetaDataImport);
         }
 
         public IDataReader DataReader
@@ -936,7 +957,7 @@ namespace Microsoft.Diagnostics.Runtime
             }
         }
 
-        public override IEnumerable<Address> EnumerateFinalizerQueue()
+        public override IEnumerable<Address> EnumerateFinalizerQueueObjectAddresses()
         {
             SubHeap[] heaps;
             if (GetHeaps(out heaps))
@@ -992,13 +1013,7 @@ namespace Microsoft.Diagnostics.Runtime
             }
         }
 
-        private bool IsInSegment(ClrSegment seg, Address p)
-        {
-            return seg.Start <= p && p <= seg.End;
-        }
-
         #region Abstract
-        internal abstract IEnumerable<ClrStackFrame> EnumerateStackFrames(uint osThreadId);
         internal abstract ulong GetFirstThread();
         internal abstract IThreadData GetThread(ulong addr);
         internal abstract IHeapDetails GetSvrHeapDetails(ulong addr);
@@ -1234,13 +1249,6 @@ namespace Microsoft.Diagnostics.Runtime
             return _dataReader.ReadMemory(address, buffer, bytesRequested, out bytesRead);
         }
 
-        [Obsolete]
-        public override bool ReadVirtual(ulong address, byte[] buffer, int bytesRequested, out int bytesRead)
-        {
-            return _dataReader.ReadMemory(address, buffer, bytesRequested, out bytesRead);
-        }
-
-
         private byte[] _dataBuffer = new byte[8];
         public bool ReadByte(Address addr, out byte value)
         {
@@ -1391,26 +1399,6 @@ namespace Microsoft.Diagnostics.Runtime
                 value = (ulong)BitConverter.ToUInt32(_dataBuffer, 0);
             else
                 value = (ulong)BitConverter.ToUInt64(_dataBuffer, 0);
-
-            return true;
-        }
-
-        public bool ReadPtr(ulong addr, out long value)
-        {
-            int ptrSize = (int)PointerSize;
-            int read = 0;
-            if (!ReadMemory(addr, _dataBuffer, ptrSize, out read))
-            {
-                value = 0xcccccccc;
-                return false;
-            }
-
-            Debug.Assert(read == ptrSize);
-
-            if (ptrSize == 4)
-                value = (long)BitConverter.ToInt32(_dataBuffer, 0);
-            else
-                value = (long)BitConverter.ToInt64(_dataBuffer, 0);
 
             return true;
         }

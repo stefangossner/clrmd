@@ -9,6 +9,14 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 {
     internal class DesktopAppDomain : ClrAppDomain
     {
+        public override ClrRuntime Runtime
+        {
+            get
+            {
+                return _runtime;
+            }
+        }
+
         /// <summary>
         /// Address of the AppDomain.
         /// </summary>
@@ -22,7 +30,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
         /// <summary>
         /// The name of the AppDomain, as specified when the domain was created.
         /// </summary>
-        public override string Name { get { return _name; } internal set { _name = value; } }
+        public override string Name { get { return _name; } }
         public override IList<ClrModule> Modules { get { return _modules; } }
 
         internal int InternalId { get { return _internalId; } }

@@ -10,10 +10,20 @@ namespace Microsoft.Diagnostics.Runtime.Native
 {
     internal class NativeAppDomain : ClrAppDomain
     {
-        private IList<ClrModule> _modules;
-
-        public NativeAppDomain(IList<ClrModule> modules)
+        public override ClrRuntime Runtime
         {
+            get
+            {
+                return _runtime;
+            }
+        }
+
+        private IList<ClrModule> _modules;
+        private ClrRuntime _runtime;
+
+        public NativeAppDomain(ClrRuntime runtime, IList<ClrModule> modules)
+        {
+            _runtime = runtime;
             _modules = modules;
         }
 
@@ -30,7 +40,6 @@ namespace Microsoft.Diagnostics.Runtime.Native
         public override string Name
         {
             get { return "default domain"; }
-            internal set { }
         }
 
         public override IList<ClrModule> Modules
@@ -57,6 +66,7 @@ namespace Microsoft.Diagnostics.Runtime.Native
         private string _filename;
         private Address _imageBase;
         private Address _size;
+        private PdbInfo _pdb;
 
         public NativeModule(NativeRuntime runtime, ModuleInfo module)
         {
@@ -65,6 +75,25 @@ namespace Microsoft.Diagnostics.Runtime.Native
             _filename = module.FileName;
             _imageBase = module.ImageBase;
             _size = module.FileSize;
+            _pdb = module.Pdb;
+        }
+
+        public override ClrRuntime Runtime
+        {
+            get
+            {
+                return _runtime;
+            }
+        }
+
+        public override PdbInfo Pdb { get { return _pdb; } }
+
+        public override IList<ClrAppDomain> AppDomains
+        {
+            get
+            {
+                return new ClrAppDomain[] { _runtime.AppDomains[0] };
+            }
         }
 
         public override string AssemblyName

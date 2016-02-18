@@ -253,23 +253,6 @@ namespace Microsoft.Diagnostics.Runtime
             return true;
         }
 
-        public bool CanReadAsync
-        {
-            get { return true; }
-        }
-
-        public AsyncMemoryReadResult ReadMemoryAsync(ulong address, int bytesRequested)
-        {
-            AsyncMemoryReadResult result = new AsyncMemoryReadResult(address, bytesRequested);
-            ThreadPool.QueueUserWorkItem(QueueMemoryRead, result);
-            return result;
-        }
-
-        private void QueueMemoryRead(object state)
-        {
-            _dumpReader.ReadMemory((AsyncMemoryReadResult)state);
-        }
-
         public bool GetThreadContext(uint threadID, uint contextFlags, uint contextSize, byte[] context)
         {
             throw new NotImplementedException();

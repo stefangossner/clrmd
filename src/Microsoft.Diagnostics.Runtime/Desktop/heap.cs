@@ -11,25 +11,25 @@ using Address = System.UInt64;
 
 namespace Microsoft.Diagnostics.Runtime.Desktop
 {
-    internal class DesktopGCHeap : HeapBase
+    internal abstract class DesktopGCHeap : HeapBase
     {
-        public DesktopGCHeap(DesktopRuntimeBase runtime, TextWriter log)
+        public DesktopGCHeap(DesktopRuntimeBase runtime)
             : base(runtime)
         {
             DesktopRuntime = runtime;
-            _log = log;
-            _lastObjType = new LastObjectType();
             _types = new List<ClrType>(1000);
             Revision = runtime.Revision;
 
             // Prepopulate a few important method tables.
-            FreeType = GetGCHeapType(DesktopRuntime.FreeMethodTable, 0, 0);
-            ArrayType = GetGCHeapType(DesktopRuntime.ArrayMethodTable, DesktopRuntime.ObjectMethodTable, 0);
-            ObjectType = GetGCHeapType(DesktopRuntime.ObjectMethodTable, 0, 0);
-            ArrayType.ComponentType = ObjectType;
+            FreeType = GetTypeByMethodTable(DesktopRuntime.FreeMethodTable, 0, 0);
+            ((DesktopHeapType)FreeType).Shared = true;
+            ObjectType = GetTypeByMethodTable(DesktopRuntime.ObjectMethodTable, 0, 0);
+            ArrayType = GetTypeByMethodTable(DesktopRuntime.ArrayMethodTable, DesktopRuntime.ObjectMethodTable, 0);
+            ArrayType.ComponentType =  ObjectType;
             ((BaseDesktopHeapType)FreeType).DesktopModule = (DesktopModule)ObjectType.Module;
-            StringType = GetGCHeapType(DesktopRuntime.StringMethodTable, 0, 0);
-            ExceptionType = GetGCHeapType(DesktopRuntime.ExceptionMethodTable, 0, 0);
+            StringType = GetTypeByMethodTable(DesktopRuntime.StringMethodTable, 0, 0);
+            ExceptionType = GetTypeByMethodTable(DesktopRuntime.ExceptionMethodTable, 0, 0);
+            ErrorType = new ErrorType(this);
 
             InitSegments(runtime);
         }
@@ -39,9 +39,12 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             return DesktopRuntime.Revision;
         }
 
-        public override ClrRuntime GetRuntime()
+        public override ClrRuntime Runtime
         {
-            return DesktopRuntime;
+            get
+            {
+                return DesktopRuntime;
+            }
         }
 
         public override ClrException GetExceptionObject(Address objRef)
@@ -59,53 +62,40 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             return new DesktopException(objRef, (BaseDesktopHeapType)type);
         }
 
-        public override ClrType GetObjectType(Address objRef)
+
+        public override ulong GetEEClassByMethodTable(ulong methodTable)
         {
-            ulong mt, cmt = 0;
+            if (methodTable == 0)
+                return 0;
 
-            if (_lastObjType.Address == objRef)
-                return _lastObjType.Type;
+            IMethodTableData mtData = DesktopRuntime.GetMethodTableData(methodTable);
+            if (mtData == null)
+                return 0;
 
-            var cache = MemoryReader;
-            if (cache.Contains(objRef))
-            {
-                if (!cache.ReadPtr(objRef, out mt))
-                    return null;
-            }
-            else if (DesktopRuntime.MemoryReader.Contains(objRef))
-            {
-                cache = DesktopRuntime.MemoryReader;
-                if (!cache.ReadPtr(objRef, out mt))
-                    return null;
-            }
-            else
-            {
-                cache = null;
-                mt = DesktopRuntime.DataReader.ReadPointerUnsafe(objRef);
-            }
-
-            if ((((int)mt) & 3) != 0)
-                mt &= ~3UL;
-
-            if (mt == DesktopRuntime.ArrayMethodTable)
-            {
-                uint elemenTypeOffset = (uint)PointerSize * 2;
-                if (cache == null)
-                    cmt = DesktopRuntime.DataReader.ReadPointerUnsafe(objRef + elemenTypeOffset);
-                else if (!cache.ReadPtr(objRef + elemenTypeOffset, out cmt))
-                    return null;
-            }
-            else
-            {
-                cmt = 0;
-            }
-
-            ClrType type = GetGCHeapType(mt, cmt, objRef);
-            _lastObjType.Address = objRef;
-            _lastObjType.Type = type;
-
-            return type;
+            return mtData.EEClass;
         }
+
+        public override ulong GetMethodTableByEEClass(ulong eeclass)
+        {
+            if (eeclass == 0)
+                return 0;
+
+            return DesktopRuntime.GetMethodTableByEEClass(eeclass);
+        }
+
+        public override bool TryGetMethodTable(ulong obj, out ulong methodTable, out ulong componentMethodTable)
+        {
+            componentMethodTable = 0;
+            if (!ReadPointer(obj, out methodTable))
+                return false;
+
+            if (methodTable == DesktopRuntime.ArrayMethodTable)
+                if (!ReadPointer(obj + (ulong)(IntPtr.Size * 2), out componentMethodTable))
+                    return false;
+
+            return true;
+        }
+
 
         internal ClrType GetGCHeapTypeFromModuleAndToken(ulong moduleAddr, uint token)
         {
@@ -131,130 +121,36 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
             return null;
         }
+        
+        internal abstract ClrType GetTypeByMethodTable(ulong mt, ulong cmt, ulong obj);
 
-        internal ClrType GetGCHeapType(ulong mt, ulong cmt)
+
+        protected ClrType TryGetComponentType(ulong obj, ulong cmt)
         {
-            return GetGCHeapType(mt, cmt, 0);
+            ClrType result = null;
+            IObjectData data = GetObjectData(obj);
+            if (data != null)
+            {
+                if (data.ElementTypeHandle != 0)
+                    result = GetTypeByMethodTable(data.ElementTypeHandle, 0, 0);
+
+                if (result == null && data.ElementType != ClrElementType.Unknown)
+                    result = GetBasicType(data.ElementType);
+            }
+            else if (cmt != 0)
+            {
+                result = GetTypeByMethodTable(cmt, 0);
+            }
+
+            return result;
         }
 
-        internal ClrType GetGCHeapType(ulong mt, ulong cmt, ulong obj)
-        {
-            if (mt == 0)
-                return null;
-
-            TypeHandle hnd = new TypeHandle(mt, cmt);
-            ClrType ret = null;
-
-            // See if we already have the type.
-            int index;
-            if (_indices.TryGetValue(hnd, out index))
-            {
-                ret = _types[index];
-            }
-            else if (mt == DesktopRuntime.ArrayMethodTable && cmt == 0)
-            {
-                // Handle the case where the methodtable is an array, but the component method table
-                // was not specified.  (This happens with fields.)  In this case, return System.Object[],
-                // with an ArrayComponentType set to System.Object.
-                uint token = DesktopRuntime.GetMetadataToken(mt);
-                if (token == 0xffffffff)
-                    return null;
-
-                ModuleEntry modEnt = new ModuleEntry(ArrayType.Module, token);
-
-                ret = ArrayType;
-                index = _types.Count;
-
-                _indices[hnd] = index;
-                _typeEntry[modEnt] = index;
-                _types.Add(ret);
-
-                Debug.Assert(_types[(int)index] == ret);
-            }
-            else
-            {
-                // No, so we'll have to construct it.
-                var moduleAddr = DesktopRuntime.GetModuleForMT(hnd.MethodTable);
-                DesktopModule module = DesktopRuntime.GetModule(moduleAddr);
-                uint token = DesktopRuntime.GetMetadataToken(mt);
-
-                bool isFree = mt == DesktopRuntime.FreeMethodTable;
-                if (token == 0xffffffff && !isFree)
-                    return null;
-
-                // Dynamic functions/modules
-                uint tokenEnt = token;
-                if (!isFree && (module == null || module.IsDynamic))
-                    tokenEnt = (uint)mt;
-
-                ModuleEntry modEnt = new ModuleEntry(module, tokenEnt);
-
-                // We key the dictionary on a Module/Token pair.  If names do not match, then
-                // do not treat these as the same type (happens with generics).
-                string typeName = DesktopRuntime.GetTypeName(hnd);
-                if (typeName == null || typeName == "<Unloaded Type>")
-                {
-                    var builder = GetTypeNameFromToken(module, token);
-                    typeName = (builder != null) ? builder.ToString() : "<UNKNOWN>";
-                }
-                else
-                {
-                    typeName = DesktopHeapType.FixGenerics(typeName);
-                }
-
-                if (_typeEntry.TryGetValue(modEnt, out index))
-                {
-                    BaseDesktopHeapType match = (BaseDesktopHeapType)_types[(int)index];
-                    if (match.Name == typeName)
-                    {
-                        _indices[hnd] = index;
-                        ret = match;
-                    }
-                }
-
-                if (ret == null)
-                {
-                    IMethodTableData mtData = DesktopRuntime.GetMethodTableData(mt);
-                    if (mtData == null)
-                        return null;
-
-                    index = _types.Count;
-                    ret = new DesktopHeapType(typeName, module, token, mt, mtData, this, index);
-
-                    _indices[hnd] = index;
-                    _typeEntry[modEnt] = index;
-                    _types.Add(ret);
-
-                    Debug.Assert(_types[(int)index] == ret);
-                }
-            }
-
-            if (obj != 0 && ret.ComponentType == null && ret.IsArray)
-            {
-                IObjectData data = GetObjectData(obj);
-                if (data != null)
-                {
-                    if (data.ElementTypeHandle != 0)
-                        ret.ComponentType = GetGCHeapType(data.ElementTypeHandle, 0, 0);
-
-                    if (ret.ComponentType == null && data.ElementType != ClrElementType.Unknown)
-                        ret.ComponentType = GetBasicType(data.ElementType);
-                }
-                else if (cmt != 0)
-                {
-                    ret.ComponentType = GetGCHeapType(cmt, 0);
-                }
-            }
-
-            return ret;
-        }
-
-        private static StringBuilder GetTypeNameFromToken(DesktopModule module, uint token)
+        protected static StringBuilder GetTypeNameFromToken(DesktopModule module, uint token)
         {
             if (module == null)
                 return null;
 
-            IMetadata meta = module.GetMetadataImport();
+            ICorDebug.IMetadataImport meta = module.GetMetadataImport();
             if (meta == null)
                 return null;
 
@@ -288,7 +184,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
 
 
-        public override IEnumerable<ulong> EnumerateFinalizableObjects()
+        public override IEnumerable<ulong> EnumerateFinalizableObjectAddresses()
         {
             SubHeap[] heaps;
             if (DesktopRuntime.GetHeaps(out heaps))
@@ -489,7 +385,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             }
 
             // Finalization Queue
-            foreach (Address objAddr in DesktopRuntime.EnumerateFinalizerQueue())
+            foreach (Address objAddr in DesktopRuntime.EnumerateFinalizerQueueObjectAddresses())
                 if (objAddr != 0)
                 {
                     ClrType type = GetObjectType(objAddr);
@@ -514,16 +410,15 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                 _firstChar = StringType.GetFieldByName("m_firstChar");
                 _stringLength = StringType.GetFieldByName("m_stringLength");
 
-                if (_firstChar.Type == null)
+                // .Type being null can happen in minidumps.  In that case we will fall back to
+                // hardcoded values and hope they don't get out of date.
+                if (_firstChar.Type == ErrorType)
                     _firstChar = null;
 
-                if (_stringLength.Type == null)
+                if (_stringLength.Type == ErrorType)
                     _stringLength = null;
 
                 _initializedStringFields = true;
-                //Debug.Assert(m_firstChar != null && m_stringLength != null);
-                //Debug.Assert(m_firstChar == null || m_firstChar.Offset + IntPtr.Size == m_runtime.GetStringFirstCharOffset());
-                //Debug.Assert(m_stringLength == null || m_stringLength.Offset + IntPtr.Size == m_runtime.GetStringLengthOffset());
             }
 
             int length = 0;
@@ -604,10 +499,6 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                     foreach (Address module in DesktopRuntime.EnumerateModules(adData))
                         modules.Add(module);
                 }
-                else if (_log != null)
-                {
-                    _log.WriteLine("Error: Could not get appdomain information from Appdomain {0:x}.  Skipping.", ad);
-                }
             }
 
             ulong arrayMt = DesktopRuntime.ArrayMethodTable;
@@ -616,22 +507,18 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                 var mtList = DesktopRuntime.GetMethodTableList(module);
                 if (mtList != null)
                 {
-                    foreach (ulong mt in mtList)
+                    foreach (var pair in mtList)
                     {
-                        if (mt != arrayMt)
+                        if (pair.MethodTable != arrayMt)
                         {
                             // prefetch element type, as this also can load types
-                            var type = GetGCHeapType(mt, 0, 0);
+                            var type = GetTypeByMethodTable(pair.MethodTable, 0, 0);
                             if (type != null)
                             {
                                 ClrElementType cet = type.ElementType;
                             }
                         }
                     }
-                }
-                else if (_log != null)
-                {
-                    _log.WriteLine("Error: Could not get method table list for module {0:x}.  Skipping.", module);
                 }
             }
         }
@@ -879,31 +766,29 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
 
         #region private
-        private TextWriter _log;
-        private List<ClrType> _types;
-        private Dictionary<TypeHandle, int> _indices = new Dictionary<TypeHandle, int>(TypeHandle.EqualityComparer);
+        protected List<ClrType> _types;
+        protected Dictionary<ModuleEntry, int> _typeEntry = new Dictionary<ModuleEntry, int>(new ModuleEntryCompare());
         private Dictionary<ArrayRankHandle, BaseDesktopHeapType> _arrayTypes;
         private ClrModule _mscorlib;
 
-        private Dictionary<ModuleEntry, int> _typeEntry = new Dictionary<ModuleEntry, int>(new ModuleEntryCompare());
         private ClrInstanceField _firstChar, _stringLength;
         private bool _initializedStringFields = false;
         private LastObjectData _lastObjData;
-        private LastObjectType _lastObjType;
         private ClrType[] _basicTypes;
         private bool _loadedTypes = false;
         #endregion
 
         internal readonly ClrInterface[] EmptyInterfaceList = new ClrInterface[0];
         internal Dictionary<string, ClrInterface> Interfaces = new Dictionary<string, ClrInterface>();
-        internal DesktopRuntimeBase DesktopRuntime { get; set; }
-        internal ClrType ObjectType { get; set; }
-        internal ClrType StringType { get; set; }
-        internal ClrType ValueType { get; set; }
-        internal ClrType FreeType { get; set; }
-        internal ClrType ExceptionType { get; set; }
+        internal DesktopRuntimeBase DesktopRuntime { get; private set; }
+        internal BaseDesktopHeapType ErrorType { get; private set; }
+        internal ClrType ObjectType { get; private set; }
+        internal ClrType StringType { get; private set; }
+        internal ClrType ValueType { get; private set; }
+        internal ClrType FreeType { get; private set; }
+        internal ClrType ExceptionType { get; private set; }
         internal ClrType EnumType { get; set; }
-        internal ClrType ArrayType { get; set; }
+        internal ClrType ArrayType { get; private set; }
 
         private class LastObjectData
         {
@@ -922,17 +807,6 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             public ClrType Type;
         }
 
-        private class ModuleEntry
-        {
-            public ClrModule Module;
-            public uint Token;
-            public ModuleEntry(ClrModule module, uint token)
-            {
-                Module = module;
-                Token = token;
-            }
-        }
-
         private class ModuleEntryCompare : IEqualityComparer<ModuleEntry>
         {
             public bool Equals(ModuleEntry mx, ModuleEntry my)
@@ -944,16 +818,6 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             {
                 return (int)obj.Token;
             }
-        }
-
-        public override ClrType GetTypeByIndex(int index)
-        {
-            return _types[index];
-        }
-
-        public override int TypeIndexLimit
-        {
-            get { return _types.Count; }
         }
 
         internal ClrType GetBasicType(ClrElementType elType)
@@ -1012,6 +876,12 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
                 switch (type.Name)
                 {
+                    case "System.ValueType":
+                        Debug.Assert(_basicTypes[(int)ClrElementType.Struct] == null);
+                        _basicTypes[(int)ClrElementType.Struct] = type;
+                        count++;
+                        break;
+
                     case "System.Boolean":
                         Debug.Assert(_basicTypes[(int)ClrElementType.Boolean] == null);
                         _basicTypes[(int)ClrElementType.Boolean] = type;
@@ -1127,7 +997,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             {
                 if (_mscorlib == null)
                 {
-                    foreach (ClrModule module in DesktopRuntime.EnumerateModules())
+                    foreach (ClrModule module in DesktopRuntime.Modules)
                     {
                         if (module.Name.Contains("mscorlib"))
                         {
@@ -1584,5 +1454,351 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             }
         }
         #endregion
+    }
+
+    struct ModuleEntry
+    {
+        public ClrModule Module;
+        public uint Token;
+        public ModuleEntry(ClrModule module, uint token)
+        {
+            Module = module;
+            Token = token;
+        }
+    }
+
+    internal class LegacyGCHeap : DesktopGCHeap
+    {
+        private LastObjectType _lastObjType = new LastObjectType();
+        private Dictionary<TypeHandle, int> _indices = new Dictionary<TypeHandle, int>(TypeHandle.EqualityComparer);
+
+        public LegacyGCHeap(DesktopRuntimeBase runtime)
+            : base(runtime)
+        {
+        }
+
+        public override bool HasComponentMethodTables
+        {
+            get
+            {
+                return true;
+            }
+        }
+
+        public override ClrType GetTypeByMethodTable(ulong mt, ulong cmt)
+        {
+            return GetTypeByMethodTable(mt, cmt, 0);
+        }
+
+        internal override ClrType GetTypeByMethodTable(ulong mt, ulong cmt, ulong obj)
+        {
+            if (mt == 0)
+                return null;
+
+            ClrType componentType = null;
+            if (mt == DesktopRuntime.ArrayMethodTable)
+            {
+                if (cmt != 0)
+                {
+                    componentType = GetTypeByMethodTable(cmt, 0);
+                    if (componentType != null)
+                    {
+                        cmt = componentType.MethodTable;
+                    }
+                    else if (obj != 0)
+                    {
+                        componentType = TryGetComponentType(obj, cmt);
+                        if (componentType != null)
+                            cmt = componentType.MethodTable;
+                    }
+                }
+                else
+                {
+                    componentType = ObjectType;
+                    cmt = ObjectType.MethodTable;
+                }
+            }
+            else
+            {
+                cmt = 0;
+            }
+
+            TypeHandle hnd = new TypeHandle(mt, cmt);
+            ClrType ret = null;
+
+            // See if we already have the type.
+            int index;
+            if (_indices.TryGetValue(hnd, out index))
+            {
+                ret = _types[index];
+            }
+            else if (mt == DesktopRuntime.ArrayMethodTable && cmt == 0)
+            {
+                // Handle the case where the methodtable is an array, but the component method table
+                // was not specified.  (This happens with fields.)  In this case, return System.Object[],
+                // with an ArrayComponentType set to System.Object.
+                uint token = DesktopRuntime.GetMetadataToken(mt);
+                if (token == 0xffffffff)
+                    return null;
+
+                ModuleEntry modEnt = new ModuleEntry(ArrayType.Module, token);
+
+                ret = ArrayType;
+                index = _types.Count;
+
+                _indices[hnd] = index;
+                _typeEntry[modEnt] = index;
+                _types.Add(ret);
+
+                Debug.Assert(_types[index] == ret);
+            }
+            else
+            {
+                // No, so we'll have to construct it.
+                var moduleAddr = DesktopRuntime.GetModuleForMT(hnd.MethodTable);
+                DesktopModule module = DesktopRuntime.GetModule(moduleAddr);
+                uint token = DesktopRuntime.GetMetadataToken(mt);
+
+                bool isFree = mt == DesktopRuntime.FreeMethodTable;
+                if (token == 0xffffffff && !isFree)
+                    return null;
+
+                // Dynamic functions/modules
+                uint tokenEnt = token;
+                if (!isFree && (module == null || module.IsDynamic))
+                    tokenEnt = (uint)mt;
+
+                ModuleEntry modEnt = new ModuleEntry(module, tokenEnt);
+
+                // We key the dictionary on a Module/Token pair.  If names do not match, then
+                // do not treat these as the same type (happens with generics).
+                string typeName = DesktopRuntime.GetTypeName(hnd);
+                if (typeName == null || typeName == "<Unloaded Type>")
+                {
+                    var builder = GetTypeNameFromToken(module, token);
+                    typeName = (builder != null) ? builder.ToString() : "<UNKNOWN>";
+                }
+                else
+                {
+                    typeName = DesktopHeapType.FixGenerics(typeName);
+                }
+
+                if (_typeEntry.TryGetValue(modEnt, out index))
+                {
+                    BaseDesktopHeapType match = (BaseDesktopHeapType)_types[index];
+                    if (match.Name == typeName)
+                    {
+                        _indices[hnd] = index;
+                        ret = match;
+                    }
+                }
+
+                if (ret == null)
+                {
+                    IMethodTableData mtData = DesktopRuntime.GetMethodTableData(mt);
+                    if (mtData == null)
+                        return null;
+
+                    ret = new DesktopHeapType(typeName, module, token, mt, mtData, this);
+                    ret.ComponentType = componentType;
+
+                    index = _types.Count;
+                    ((DesktopHeapType)ret).SetIndex(index);
+                    _indices[hnd] = index;
+                    _typeEntry[modEnt] = index;
+                    _types.Add(ret);
+
+                    Debug.Assert(_types[index] == ret);
+                }
+            }
+
+            if (obj != 0 && ret.ComponentType == null && ret.IsArray)
+                ret.ComponentType = TryGetComponentType(obj, cmt);
+
+            return ret;
+        }
+
+
+        public override ClrType GetObjectType(Address objRef)
+        {
+            ulong mt, cmt = 0;
+
+            if (_lastObjType.Address == objRef)
+                return _lastObjType.Type;
+
+            var cache = MemoryReader;
+            if (cache.Contains(objRef))
+            {
+                if (!cache.ReadPtr(objRef, out mt))
+                    return null;
+            }
+            else if (DesktopRuntime.MemoryReader.Contains(objRef))
+            {
+                cache = DesktopRuntime.MemoryReader;
+                if (!cache.ReadPtr(objRef, out mt))
+                    return null;
+            }
+            else
+            {
+                cache = null;
+                mt = DesktopRuntime.DataReader.ReadPointerUnsafe(objRef);
+            }
+
+            if ((((int)mt) & 3) != 0)
+                mt &= ~3UL;
+
+            if (mt == DesktopRuntime.ArrayMethodTable)
+            {
+                uint elemenTypeOffset = (uint)PointerSize * 2;
+                if (cache == null)
+                    cmt = DesktopRuntime.DataReader.ReadPointerUnsafe(objRef + elemenTypeOffset);
+                else if (!cache.ReadPtr(objRef + elemenTypeOffset, out cmt))
+                    return null;
+            }
+            else
+            {
+                cmt = 0;
+            }
+
+            ClrType type = GetTypeByMethodTable(mt, cmt, objRef);
+            _lastObjType.Address = objRef;
+            _lastObjType.Type = type;
+
+            return type;
+        }
+
+    }
+
+    internal class V46GCHeap : DesktopGCHeap
+    {
+        private LastObjectType _lastObjType = new LastObjectType();
+        private Dictionary<Address, int> _indices = new Dictionary<Address, int>();
+        
+        public V46GCHeap(DesktopRuntimeBase runtime)
+            : base(runtime)
+        {
+
+        }
+
+        public override ClrType GetObjectType(Address objRef)
+        {
+            ulong mt;
+
+            if (_lastObjType.Address == objRef)
+                return _lastObjType.Type;
+
+            var cache = MemoryReader;
+            if (cache.Contains(objRef))
+            {
+                if (!cache.ReadPtr(objRef, out mt))
+                    return null;
+            }
+            else if (DesktopRuntime.MemoryReader.Contains(objRef))
+            {
+                cache = DesktopRuntime.MemoryReader;
+                if (!cache.ReadPtr(objRef, out mt))
+                    return null;
+            }
+            else
+            {
+                cache = null;
+                mt = DesktopRuntime.DataReader.ReadPointerUnsafe(objRef);
+            }
+
+            if ((((int)mt) & 3) != 0)
+                mt &= ~3UL;
+            
+            ClrType type = GetTypeByMethodTable(mt, 0, objRef);
+            _lastObjType.Address = objRef;
+            _lastObjType.Type = type;
+
+            return type;
+        }
+
+        public override ClrType GetTypeByMethodTable(ulong mt, ulong cmt)
+        {
+            return GetTypeByMethodTable(mt, 0, 0);
+        }
+
+        internal override ClrType GetTypeByMethodTable(ulong mt, ulong _, ulong obj)
+        {
+            if (mt == 0)
+                return null;
+
+            ClrType ret = null;
+
+            // See if we already have the type.
+            int index;
+            if (_indices.TryGetValue(mt, out index))
+            {
+                ret = _types[index];
+            }
+            else
+            {
+                // No, so we'll have to construct it.
+                var moduleAddr = DesktopRuntime.GetModuleForMT(mt);
+                DesktopModule module = DesktopRuntime.GetModule(moduleAddr);
+                uint token = DesktopRuntime.GetMetadataToken(mt);
+
+                bool isFree = mt == DesktopRuntime.FreeMethodTable;
+                if (token == 0xffffffff && !isFree)
+                    return null;
+
+                // Dynamic functions/modules
+                uint tokenEnt = token;
+                if (!isFree && (module == null || module.IsDynamic))
+                    tokenEnt = (uint)mt;
+
+                ModuleEntry modEnt = new ModuleEntry(module, tokenEnt);
+
+                // We key the dictionary on a Module/Token pair.  If names do not match, then
+                // do not treat these as the same type (happens with generics).
+                string typeName = DesktopRuntime.GetNameForMT(mt);
+                if (typeName == null || typeName == "<Unloaded Type>")
+                {
+                    var builder = GetTypeNameFromToken(module, token);
+                    typeName = (builder != null) ? builder.ToString() : "<UNKNOWN>";
+                }
+                else
+                {
+                    typeName = DesktopHeapType.FixGenerics(typeName);
+                }
+
+                if (_typeEntry.TryGetValue(modEnt, out index))
+                {
+                    BaseDesktopHeapType match = (BaseDesktopHeapType)_types[index];
+                    if (match.Name == typeName)
+                    {
+                        _indices[mt] = index;
+                        ret = match;
+                    }
+                }
+
+                if (ret == null)
+                {
+                    IMethodTableData mtData = DesktopRuntime.GetMethodTableData(mt);
+                    if (mtData == null)
+                        return null;
+
+                    ret = new DesktopHeapType(typeName, module, token, mt, mtData, this);
+                    
+                    index = _types.Count;
+                    ((DesktopHeapType)ret).SetIndex(index);
+                    _indices[mt] = index;
+
+                    // Arrays share a common token, so it's not helpful to look them up here.
+                    if (!ret.IsArray)
+                        _typeEntry[modEnt] = index;
+
+                    _types.Add(ret);
+                    Debug.Assert(_types[index] == ret);
+                }
+            }
+
+            if (obj != 0 && ret.ComponentType == null && ret.IsArray)
+                ret.ComponentType = TryGetComponentType(obj, 0);
+
+            return ret;
+        }
     }
 }

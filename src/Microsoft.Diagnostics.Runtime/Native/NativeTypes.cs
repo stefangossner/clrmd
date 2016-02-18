@@ -31,11 +31,24 @@ namespace Microsoft.Diagnostics.Runtime.Native
             _containsPointers = mtData.ContainsPointers;
         }
 
-        public override int Index
+        internal override ClrMethod GetMethod(uint token)
         {
-            get { return _index; }
+            return null;
         }
 
+        public override ulong MethodTable
+        {
+            get
+            {
+                return _eeType;
+            }
+        }
+
+        public override IEnumerable<ulong> EnumerateMethodTables()
+        {
+            return new ulong[] { _eeType };
+        }
+        
         public override ClrModule Module
         {
             get

@@ -72,7 +72,7 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
             _stream = stream;
             _headerBuff = buffer;
             Header = header;
-            if (Header.PEHeaderSize > _headerBuff.Length)
+            if (header != null && header.PEHeaderSize > _headerBuff.Length)
                 throw new InvalidOperationException("Bad PE Header in " + filePath);
         }
         /// <summary>
@@ -335,6 +335,8 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
 
         private PEHeader(PEBuffer buffer, bool virt)
         {
+            _virt = virt;
+
             byte* ptr = buffer.Fetch(0, 0x300);
             _dosHeader = (IMAGE_DOS_HEADER*)ptr;
             _ntHeader = (IMAGE_NT_HEADERS*)((byte*)ptr + _dosHeader->e_lfanew);

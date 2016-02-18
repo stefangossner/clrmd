@@ -8,43 +8,61 @@ using Address = System.UInt64;
 using System.IO;
 using System.Runtime.InteropServices;
 using Microsoft.Diagnostics.Runtime.Utilities;
+using System.Linq;
 
 namespace Microsoft.Diagnostics.Runtime.Desktop
 {
     internal abstract class DesktopBaseModule : ClrModule
     {
+        protected DesktopRuntimeBase _runtime;
+
+        public override ClrRuntime Runtime
+        {
+            get
+            {
+                return _runtime;
+            }
+        }
+
         internal abstract Address GetDomainModule(ClrAppDomain appDomain);
 
         internal Address ModuleId { get; set; }
 
-        internal virtual IMetadata GetMetadataImport()
+        internal virtual ICorDebug.IMetadataImport GetMetadataImport()
         {
             return null;
         }
 
         public int Revision { get; set; }
+
+        public DesktopBaseModule(DesktopRuntimeBase runtime)
+        {
+            _runtime = runtime;
+    }
     }
 
     internal class DesktopModule : DesktopBaseModule
     {
+        static PdbInfo s_failurePdb = new PdbInfo();
+
         private bool _reflection, _isPE;
         private string _name, _assemblyName;
-        private DesktopRuntimeBase _runtime;
-        private IMetadata _metadata;
+        private ICorDebug.IMetadataImport _metadata;
         private Dictionary<ClrAppDomain, ulong> _mapping = new Dictionary<ClrAppDomain, ulong>();
         private Address _imageBase, _size;
         private Address _metadataStart;
         private Address _metadataLength;
         private DebuggableAttribute.DebuggingModes? _debugMode;
-        private Address _address;
         private Address _assemblyAddress;
         private bool _typesLoaded;
+        ClrAppDomain[] _appDomainList;
+        PdbInfo _pdb;
 
         public DesktopModule(DesktopRuntimeBase runtime, ulong address, IModuleData data, string name, string assemblyName, ulong size)
+            : base(runtime)
         {
             Revision = runtime.Revision;
             _imageBase = data.ImageBase;
-            _runtime = runtime;
             _assemblyName = assemblyName;
             _isPE = data.IsPEFile;
             _reflection = data.IsReflection || string.IsNullOrEmpty(name) || !name.Contains("\\");
@@ -54,14 +72,13 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             _metadataStart = data.MetdataStart;
             _metadataLength = data.MetadataLength;
             _assemblyAddress = data.Assembly;
-            _address = address;
             _size = size;
 
             if (!runtime.DataReader.IsMinidump)
             {
                 // This is very expensive in the minidump case, as we may be heading out to the symbol server or
                 // reading multiple files from disk. Only optimistically fetch this data if we have full memory.
-                _metadata = data.LegacyMetaDataImport as IMetadata;
+                _metadata = data.LegacyMetaDataImport as ICorDebug.IMetadataImport;
             }
             else
             {
@@ -83,10 +100,62 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             }
         }
 
+        public override PdbInfo Pdb
+        {
+            get
+            {
+                if (_pdb == null)
+                {
+                    try
+                    {
+                        using (PEFile pefile = new PEFile(new ReadVirtualStream(_runtime.DataReader, (long)ImageBase, (long)(Size > 0 ? Size : 0x1000)), true))
+                        {
+                            _pdb = pefile.PdbInfo ?? s_failurePdb;
+                        }
+                    }
+                    catch
+                    {
+                    }
+                }
+
+                return _pdb != s_failurePdb ? _pdb : null;
+            }
+        }
+
+
+        internal ulong GetMTForDomain(ClrAppDomain domain, DesktopHeapType type)
+        {
+            DesktopGCHeap heap = null;
+            var mtList = _runtime.GetMethodTableList(_mapping[domain]);
+
+            bool hasToken = type.MetadataToken != 0 && type.MetadataToken != uint.MaxValue;
+
+            uint token = ~0xff000000 & type.MetadataToken;
+
+            foreach (MethodTableTokenPair pair in mtList)
+            {
+                if (hasToken)
+                {
+                    if (pair.Token == token)
+                        return pair.MethodTable;
+                }
+                else
+                {
+                    if (heap == null)
+                        heap = (DesktopGCHeap)_runtime.GetHeap();
+
+                    if (heap.GetTypeByMethodTable(pair.MethodTable, 0) == type)
+                        return pair.MethodTable;
+                }
+            }
+
+            return 0;
+        }
+
         public override IEnumerable<ClrType> EnumerateTypes()
         {
             var heap = (DesktopGCHeap)_runtime.GetHeap();
-            var mtList = _runtime.GetMethodTableList(_address);
+            var mtList = _runtime.GetMethodTableList(_mapping.First().Value);
             if (_typesLoaded)
             {
                 foreach (var type in heap.EnumerateTypes())
@@ -97,12 +166,13 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             {
                 if (mtList != null)
                 {
-                    foreach (ulong mt in mtList)
+                    foreach (var pair in mtList)
                     {
+                        ulong mt = pair.MethodTable;
                         if (mt != _runtime.ArrayMethodTable)
                         {
                             // prefetch element type, as this also can load types
-                            var type = heap.GetGCHeapType(mt, 0, 0);
+                            var type = heap.GetTypeByMethodTable(mt, 0, 0);
                             if (type != null)
                                 yield return type;
                         }
@@ -146,6 +216,21 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             _mapping[domain] = domainModule;
         }
 
+        public override IList<ClrAppDomain> AppDomains
+        {
+            get
+            {
+                if (_appDomainList == null)
+                {
+                    _appDomainList = new ClrAppDomain[_mapping.Keys.Count];
+                    _appDomainList = _mapping.Keys.ToArray();
+                    Array.Sort(_appDomainList, (d, d2) => d.Id.CompareTo(d2.Id));
+                }
+
+                return _appDomainList;
+            }
+        }
+
         internal override ulong GetDomainModule(ClrAppDomain domain)
         {
             _runtime.InitDomains();
@@ -164,7 +249,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             return 0;
         }
 
-        internal override IMetadata GetMetadataImport()
+        internal override ICorDebug.IMetadataImport GetMetadataImport()
         {
             if (Revision != _runtime.Revision)
                 ClrDiagnosticsException.ThrowRevisionError(Revision, _runtime.Revision);
@@ -192,11 +277,6 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             {
                 return _size;
             }
-        }
-
-        internal void SetImageSize(Address size)
-        {
-            _size = size;
         }
 
 
@@ -229,7 +309,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
         private void InitDebugAttributes()
         {
-            IMetadata metadata = GetMetadataImport();
+            ICorDebug.IMetadataImport metadata = GetMetadataImport();
             if (metadata == null)
             {
                 _debugMode = DebuggableAttribute.DebuggingModes.None;
@@ -281,6 +361,27 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
     {
         private static uint s_id = 0;
         private uint _id = s_id++;
+
+        public ErrorModule(DesktopRuntimeBase runtime)
+            : base(runtime)
+        {
+        }
+
+        public override PdbInfo Pdb
+        {
+            get
+            {
+                return null;
+            }
+        }
+
+        public override IList<ClrAppDomain> AppDomains
+        {
+            get
+            {
+                return new ClrAppDomain[0];
+            }
+        }
 
         public override string AssemblyName
         {
