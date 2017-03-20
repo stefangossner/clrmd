@@ -8,6 +8,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Text;
+using System.Runtime.InteropServices;
 
 namespace Microsoft.Diagnostics.Runtime.Utilities
 {
@@ -256,10 +257,7 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
         {
             try
             {
-                Guid fileGuid;
-                int fileAge;
-                PdbReader.GetPdbProperties(pdbName, out fileGuid, out fileAge);
-
+                PdbReader.GetPdbProperties(pdbName, out Guid fileGuid, out int fileAge);
                 return guid == fileGuid && age == fileAge;
             }
             catch (IOException)
@@ -285,7 +283,6 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
             {
                 if (!checkProperties)
                 {
-                    Trace("Found '{0}' for file {1}.", fullPath, Path.GetFileName(fullPath));
                     return true;
                 }
 
@@ -296,7 +293,6 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
                         var header = pefile.Header;
                         if (!checkProperties || (header.TimeDateStampSec == buildTimeStamp && header.SizeOfImage == imageSize))
                         {
-                            Trace("Found '{0}' at '{1}'.", Path.GetFileName(fullPath), fullPath);
                             return true;
                         }
                         else
@@ -377,7 +373,7 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
             if (args != null && args.Length > 0)
                 fmt = string.Format(fmt, args);
 
-            System.Diagnostics.Trace.WriteLine(fmt, "symbols");
+            System.Diagnostics.Trace.WriteLine(fmt, "Microsoft.Diagnostics.Runtime.SymbolLocator");
         }
 
         /// <summary>
@@ -451,8 +447,13 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
                     string fullPath = Path.Combine(element.Target, pdbSimpleName);
                     if (ValidatePdb(fullPath, pdbIndexGuid, pdbIndexAge))
                     {
+                        Trace($"Found pdb '{pdbSimpleName}' at '{fullPath}'.");
                         SetPdbEntry(missingPdbs, entry, fullPath);
                         return fullPath;
+                    }
+                    else
+                    {
+                        Trace($"Mismatched pdb found at '{fullPath}'.");
                     }
                 }
             }
@@ -502,8 +503,13 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
                         exeIndexPath = GetIndexPath(fileName, buildTimeStamp, imageSize);
 
                     string target = TryGetFileFromServer(element.Target, exeIndexPath, element.Cache ?? SymbolCache);
-                    if (ValidateBinary(target, buildTimeStamp, imageSize, checkProperties))
+                    if (target == null)
                     {
+                        Trace($"Server '{element.Target}' did not have file '{Path.GetFileName(fileName)}' with timestamp={buildTimeStamp:x} and filesize={imageSize:x}.");
+                    }
+                    else if (ValidateBinary(target, buildTimeStamp, imageSize, checkProperties))
+                    {
+                        Trace($"Found '{fileName}' on server '{element.Target}'.  Copied to '{target}'.");
                         SetFileEntry(missingFiles, entry, target);
                         return target;
                     }
@@ -513,6 +519,7 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
                     string filePath = Path.Combine(element.Target, fileName);
                     if (ValidateBinary(filePath, buildTimeStamp, imageSize, checkProperties))
                     {
+                        Trace($"Found '{fileName}' at '{filePath}'.");
                         SetFileEntry(missingFiles, entry, filePath);
                         return filePath;
                     }
@@ -661,62 +668,6 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
                 return fullDestPath;
             }
         }
-
-#if V2_SUPPORT
-        private Dictionary<FileEntry, string> _binCache = new Dictionary<FileEntry, string>();
-        private Dictionary<PdbEntry, string> _pdbCache = new Dictionary<PdbEntry, string>();
-        
-
-        private bool IsMissing<T>(HashSet<T> entries, T entry)
-        {
-            return entries.Contains(entry);
-        }
-        
-        private string GetFileEntry(FileEntry entry)
-        {
-            string result;
-            if (!_binCache.TryGetValue(entry, out result))
-                return null;
-
-            Debug.Assert(result != null);
-            if (File.Exists(result))
-                return result;
-
-            _binCache.Remove(entry);
-            return null;
-        }
-
-        private void SetFileEntry(HashSet<FileEntry> missing, FileEntry entry, string value)
-        {
-            if (value == null)
-                missing.Add(entry);
-            else
-                _binCache[entry] = value;
-        }
-
-
-        private string GetPdbEntry(PdbEntry entry)
-        {
-            string result;
-            if (!_pdbCache.TryGetValue(entry, out result))
-                return null;
-
-            Debug.Assert(result != null);
-            if (File.Exists(result))
-                return result;
-
-            _pdbCache.Remove(entry);
-            return null;
-        }
-
-        private void SetPdbEntry(HashSet<PdbEntry> missing, PdbEntry entry, string value)
-        {
-            if (value == null)
-                missing.Add(entry);
-            else
-                _pdbCache[entry] = value;
-        }
-#endif
     }
 
     internal struct FileEntry : IEquatable<FileEntry>
@@ -777,18 +728,22 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
         }
     }
 
-    internal class FileLoader
+    internal class FileLoader : ICorDebug.ICLRDebuggingLibraryProvider
     {
         private Dictionary<string, PEFile> _pefileCache = new Dictionary<string, PEFile>(StringComparer.OrdinalIgnoreCase);
+        private DataTarget _dataTarget;
+        
+        public FileLoader(DataTarget dt)
+        {
+            _dataTarget = dt;
+        }
 
-
-        public PEFile LoadBinary(string fileName)
+        public PEFile LoadPEFile(string fileName)
         {
             if (string.IsNullOrEmpty(fileName))
                 return null;
 
-            PEFile result;
-            if (_pefileCache.TryGetValue(fileName, out result))
+            if (_pefileCache.TryGetValue(fileName, out PEFile result))
             {
                 if (!result.Disposed)
                     return result;
@@ -807,6 +762,19 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
             }
 
             return result;
+        }
+
+        public int ProvideLibrary([In, MarshalAs(UnmanagedType.LPWStr)] string fileName, int timestamp, int sizeOfImage, out IntPtr hModule)
+        {
+            string result = _dataTarget.SymbolLocator.FindBinary(fileName, timestamp, sizeOfImage, false);
+            if (result == null)
+            {
+                hModule = IntPtr.Zero;
+                return -1;
+            }
+
+            hModule = NativeMethods.LoadLibrary(result);
+            return 0;
         }
     }
 }

@@ -5,10 +5,12 @@ using System;
 using System.Runtime.InteropServices;
 using System.Text;
 
-namespace Microsoft.Diagnostics.Runtime
+#pragma warning disable 1591
+
+namespace Microsoft.Diagnostics.Runtime.ICorDebug
 {
     [Guid("7DAC8207-D3AE-4c75-9B67-92801A497D44"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-    internal interface IMetadata
+    public interface IMetadataImport
     {
         //STDMETHOD_(void, CloseEnum)(HCORENUM hEnum) PURE;
         [PreserveSig]
@@ -348,7 +350,8 @@ namespace Microsoft.Diagnostics.Runtime
         //         mdToken     tk,                     // Member for which to set offset   
         //         ULONG       *pulCodeRVA,            // The offset   
         //         DWORD       *pdwImplFlags) PURE;    // the implementation flags 
-        void GetRVA_();
+        [PreserveSig]
+        int GetRVA(uint token, [Out] out uint pRva, [Out] out uint flags);
 
         //     STDMETHOD(GetPermissionSetProps) (  
         //         mdPermission pm,                    // [IN] the permission token.   
@@ -614,7 +617,7 @@ namespace Microsoft.Diagnostics.Runtime
 
 
     // IMetaDataImport2
-    internal interface IMetadataImport2 : IMetadata
+    internal interface IMetadataImport2 : IMetadataImport
     {
         #region inheritted methods from IMetadataImport
         // <strip>@todo - check if there will be be better way how to declare IMetadataImport2 interface.
@@ -954,7 +957,8 @@ namespace Microsoft.Diagnostics.Runtime
         //         mdToken     tk,                     // Member for which to set offset   
         //         ULONG       *pulCodeRVA,            // The offset   
         //         DWORD       *pdwImplFlags) PURE;    // the implementation flags 
-        new void GetRVA_();
+        [PreserveSig]
+        new int GetRVA(uint token, [Out] out uint pRva, [Out] out uint flags);
 
         //     STDMETHOD(GetPermissionSetProps) (  
         //         mdPermission pm,                    // [IN] the permission token.   

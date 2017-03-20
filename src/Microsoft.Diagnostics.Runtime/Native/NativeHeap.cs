@@ -4,15 +4,14 @@
 using Microsoft.Diagnostics.Runtime.Desktop;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
-using Address = System.UInt64;
 
 namespace Microsoft.Diagnostics.Runtime.Native
 {
     internal class NativeHeap : HeapBase
     {
         internal NativeRuntime NativeRuntime { get; set; }
-        internal TextWriter Log { get; set; }
         private ulong _lastObj;
         private ClrType _lastType;
         private Dictionary<ulong, int> _indices = new Dictionary<ulong, int>();
@@ -20,29 +19,126 @@ namespace Microsoft.Diagnostics.Runtime.Native
         private NativeModule[] _modules;
         private NativeModule _mrtModule;
         private NativeType _free;
+        private ISymbolProvider _symProvider;
+        private Dictionary<NativeModule, ISymbolResolver> _resolvers = new Dictionary<NativeModule, ISymbolResolver>();
 
-        internal NativeHeap(NativeRuntime runtime, NativeModule[] modules, TextWriter log)
+        public override ClrType Free => _free;
+
+        internal class NativeStackFrame : ClrStackFrame
+        {
+            private ulong _ip;
+            private string _symbolName;
+            private ClrModule _module;
+
+            public NativeStackFrame(ulong ip, string symbolName, ClrModule module)
+            {
+                _ip = ip;
+                _symbolName = symbolName;
+                _module = module;
+            }
+
+            public override string DisplayString
+            {
+                get
+                {
+                    return _symbolName;
+                }
+            }
+
+            public ClrModule Module
+            {
+                get
+                {
+                    return _module;
+                }
+            }
+
+            public override ulong InstructionPointer
+            {
+                get
+                {
+                    return _ip;
+                }
+            }
+
+            public override ClrStackFrameType Kind
+            {
+                get
+                {
+                    return ClrStackFrameType.Unknown;
+                }
+            }
+
+            public override ClrMethod Method
+            {
+                get
+                {
+                    return null;
+                }
+            }
+
+            public override ulong StackPointer
+            {
+                get
+                {
+                    return 0;
+                }
+            }
+
+            public override ClrThread Thread
+            {
+                get
+                {
+                    return null;
+                }
+            }
+        }
+
+        internal NativeHeap(NativeRuntime runtime, NativeModule[] modules)
             : base(runtime)
         {
-            Log = log;
             NativeRuntime = runtime;
             _modules = modules;
+
+            _symProvider = runtime.DataTarget.SymbolProvider;
+            if (_symProvider == null)
+                throw new InvalidOperationException("You must set DataTarget.SymbolProvider to enumerate the heap on a .Net Native runtime.");
+
             _mrtModule = FindMrtModule();
 
             CreateFreeType();
             InitSegments(runtime);
+
         }
 
-        public override ClrRuntime GetRuntime() { return NativeRuntime; }
-
-        public override int TypeIndexLimit
+        public override bool TryGetMethodTable(ulong obj, out ulong methodTable, out ulong componentMethodTable)
         {
-            get { return _types.Count; }
+            throw new NotImplementedException();
         }
 
-        public override ClrType GetTypeByIndex(int index)
+        public override ClrRuntime Runtime
         {
-            return _types[index];
+            get
+            {
+                return NativeRuntime;
+            }
+        }
+
+        public override ClrType GetTypeByMethodTable(ulong methodTable, ulong componentMethodTable)
+        {
+            if ((((int)methodTable) & 3) != 0)
+                methodTable &= ~3UL;
+
+            if (componentMethodTable != 0)
+                return null;
+
+            ClrType clrType = null;
+            if (_indices.TryGetValue(methodTable, out int index))
+                clrType = _types[index];
+            else
+                clrType = ConstructObjectType(methodTable);
+
+            return clrType;
         }
 
         private NativeModule FindMrtModule()
@@ -66,8 +162,6 @@ namespace Microsoft.Diagnostics.Runtime.Native
 
         public override ClrType GetObjectType(ulong objRef)
         {
-            ulong eeType;
-
             if (_lastObj == objRef)
                 return _lastType;
 
@@ -75,19 +169,10 @@ namespace Microsoft.Diagnostics.Runtime.Native
             if (!cache.Contains(objRef))
                 cache = NativeRuntime.MemoryReader;
 
-            if (!cache.ReadPtr(objRef, out eeType))
+            if (!cache.ReadPtr(objRef, out ulong eeType))
                 return null;
 
-            if ((((int)eeType) & 3) != 0)
-                eeType &= ~3UL;
-
-            ClrType last = null;
-            int index;
-            if (_indices.TryGetValue(eeType, out index))
-                last = _types[index];
-            else
-                last = ConstructObjectType(eeType);
-
+            ClrType last = this.GetTypeByMethodTable(eeType);
             _lastObj = objRef;
             _lastType = last;
             return last;
@@ -106,8 +191,7 @@ namespace Microsoft.Diagnostics.Runtime.Native
             ulong canonType = isArray ? componentType : mtData.EEClass;
             if (!isArray && canonType != 0)
             {
-                int index;
-                if (!isArray && _indices.TryGetValue(canonType, out index))
+                if (!isArray && _indices.TryGetValue(canonType, out int index))
                 {
                     _indices[eeType] = index;  // Link the original eeType to its canonical GCHeapType.
                     return _types[index];
@@ -118,9 +202,33 @@ namespace Microsoft.Diagnostics.Runtime.Native
                 canonType = tmp;
             }
 
-            // TODO:  NativeRuntime needs to resolve addresses into eetype names.
-            string name = string.Format("type names not impl {0:x}", eeType);
 
+            NativeModule module = FindContainingModule(eeType);
+            if (module == null && canonType != 0)
+                module = FindContainingModule(canonType);
+
+            string name = null;
+            if (module != null)
+            {
+                Debug.Assert(module.ImageBase < eeType);
+
+                PdbInfo pdb = module.Pdb;
+
+                if (pdb != null)
+                {
+                    if (!_resolvers.TryGetValue(module, out ISymbolResolver resolver))
+                        _resolvers[module] = resolver = _symProvider.GetSymbolResolver(pdb.FileName, pdb.Guid, pdb.Revision);
+
+                    name = resolver?.GetSymbolNameByRVA((uint)(eeType - module.ImageBase));
+                }
+            }
+
+            if (name == null)
+            {
+                string moduleName = module != null ? Path.GetFileNameWithoutExtension(module.FileName) : "UNKNWON";
+                name = string.Format("{0}_{1:x}", moduleName, eeType);
+            }
+            
             int len = name.Length;
             if (name.EndsWith("::`vftable'"))
                 len -= 11;
@@ -130,10 +238,7 @@ namespace Microsoft.Diagnostics.Runtime.Native
 
             if (isArray)
                 name += "[]";
-
-            NativeModule module = FindContainingModule(eeType);
-            if (module == null && canonType != 0)
-                module = FindContainingModule(canonType);
+            
 
             if (module == null)
                 module = _mrtModule;
@@ -147,7 +252,13 @@ namespace Microsoft.Diagnostics.Runtime.Native
             return type;
         }
 
-        private NativeModule FindContainingModule(Address eeType)
+        internal NativeModule GetModuleFromAddress(ulong addr)
+        {
+            // we expect addr to either be a pointer to a EE class desc or a stack IP pointing to a MD
+            return FindContainingModule(addr);
+        }
+
+        private NativeModule FindContainingModule(ulong eeType)
         {
             int min = 0, max = _modules.Length;
 
@@ -190,7 +301,7 @@ namespace Microsoft.Diagnostics.Runtime.Native
 
             // Finalizer Queue.
             ClrAppDomain domain = NativeRuntime.AppDomains[0];
-            foreach (ulong obj in NativeRuntime.EnumerateFinalizerQueue())
+            foreach (ulong obj in NativeRuntime.EnumerateFinalizerQueueObjectAddresses())
             {
                 ClrType type = GetObjectType(obj);
                 if (type == null)
@@ -200,21 +311,20 @@ namespace Microsoft.Diagnostics.Runtime.Native
             }
         }
 
-        public override int ReadMemory(Address address, byte[] buffer, int offset, int count)
+        public override int ReadMemory(ulong address, byte[] buffer, int offset, int count)
         {
             if (offset != 0)
                 throw new NotImplementedException("Non-zero offsets not supported (yet)");
 
-            int bytesRead = 0;
-            if (!NativeRuntime.ReadMemory(address, buffer, count, out bytesRead))
+            if (!NativeRuntime.ReadMemory(address, buffer, count, out int bytesRead))
                 return 0;
             return bytesRead;
         }
 
         public override IEnumerable<ClrType> EnumerateTypes() { return null; }
-        public override IEnumerable<Address> EnumerateFinalizableObjects() { throw new NotImplementedException(); }
+        public override IEnumerable<ulong> EnumerateFinalizableObjectAddresses() { throw new NotImplementedException(); }
         public override IEnumerable<BlockingObject> EnumerateBlockingObjects() { throw new NotImplementedException(); }
-        public override ClrException GetExceptionObject(Address objRef) { throw new NotImplementedException(); }
+        public override ClrException GetExceptionObject(ulong objRef) { throw new NotImplementedException(); }
 
         protected override int GetRuntimeRevision()
         {
@@ -255,7 +365,7 @@ namespace Microsoft.Diagnostics.Runtime.Native
             }
         }
 
-        public NativeFinalizerRoot(Address obj, ClrType type, ClrAppDomain domain, string name)
+        public NativeFinalizerRoot(ulong obj, ClrType type, ClrAppDomain domain, string name)
         {
             Object = obj;
             _name = name;

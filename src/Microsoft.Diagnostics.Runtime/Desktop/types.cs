@@ -5,9 +5,9 @@ using Microsoft.Diagnostics.Runtime.Utilities;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using System.Reflection;
 using System.Text;
-using Address = System.UInt64;
 
 namespace Microsoft.Diagnostics.Runtime.Desktop
 {
@@ -37,7 +37,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
         protected ClrElementType _elementType;
         protected uint _token;
         private IList<ClrInterface> _interfaces;
-        public bool Shared { get; protected set; }
+        public bool Shared { get; internal set; }
         internal abstract ulong GetModuleAddress(ClrAppDomain domain);
 
 
@@ -46,6 +46,11 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             DesktopHeap = heap;
             DesktopModule = module;
             _token = token;
+        }
+
+        internal override ClrMethod GetMethod(uint token)
+        {
+            return null;
         }
 
         internal DesktopGCHeap DesktopHeap { get; set; }
@@ -80,7 +85,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
             BaseDesktopHeapType baseType = BaseType as BaseDesktopHeapType;
             List<ClrInterface> interfaces = baseType != null ? new List<ClrInterface>(baseType.Interfaces) : null;
-            IMetadata import = DesktopModule.GetMetadataImport();
+            ICorDebug.IMetadataImport import = DesktopModule.GetMetadataImport();
             if (import == null)
             {
                 _interfaces = DesktopHeap.EmptyInterfaceList;
@@ -99,8 +104,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
                 for (int i = 0; i < count; ++i)
                 {
-                    int mdClass, mdIFace;
-                    res = import.GetInterfaceImplProps(mdTokens[i], out mdClass, out mdIFace);
+                    res = import.GetInterfaceImplProps(mdTokens[i], out int mdClass, out int mdIFace);
 
                     if (interfaces == null)
                         interfaces = new List<ClrInterface>(count == mdTokens.Length ? 64 : count);
@@ -123,13 +127,10 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
 
 
-        private ClrInterface GetInterface(IMetadata import, int mdIFace)
+        private ClrInterface GetInterface(ICorDebug.IMetadataImport import, int mdIFace)
         {
             StringBuilder builder = new StringBuilder(1024);
-            int extends, cnt;
-            System.Reflection.TypeAttributes attr;
-            int res = import.GetTypeDefProps(mdIFace, builder, builder.Capacity, out cnt, out attr, out extends);
-            int scope;
+            int res = import.GetTypeDefProps(mdIFace, builder, builder.Capacity, out int count, out TypeAttributes attr, out int extends);
 
             string name = null;
             ClrInterface result = null;
@@ -139,7 +140,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             }
             else if (res == 1)
             {
-                res = import.GetTypeRefProps(mdIFace, out scope, builder, builder.Capacity, out cnt);
+                res = import.GetTypeRefProps(mdIFace, out int scope, builder, builder.Capacity, out count);
                 if (res == 0)
                 {
                     name = builder.ToString();
@@ -182,17 +183,25 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
         public override ClrModule Module { get { return DesktopModule; } }
 
+        public override ulong MethodTable
+        {
+            get
+            {
+                // We have no good way of finding this value, unfortunately
+                return 0;
+            }
+        }
 
-        internal override Address GetModuleAddress(ClrAppDomain domain)
+        public override IEnumerable<ulong> EnumerateMethodTables()
+        {
+            return new ulong[] { MethodTable };
+        }
+
+        internal override ulong GetModuleAddress(ClrAppDomain domain)
         {
             return 0;
         }
-
-        public override int Index
-        {
-            get { return -1; }
-        }
-
+        
         public override string Name
         {
             get
@@ -270,7 +279,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             return "POINTER";
         }
 
-        public override bool IsFinalizeSuppressed(Address obj)
+        public override bool IsFinalizeSuppressed(ulong obj)
         {
             return false;
         }
@@ -301,13 +310,13 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
         override public IList<ClrMethod> Methods { get { return new ClrMethod[0]; } }
 
-        public override Address GetSize(Address objRef)
+        public override ulong GetSize(ulong objRef)
         {
             ClrType realType = DesktopHeap.GetObjectType(objRef);
             return realType.GetSize(objRef);
         }
 
-        public override void EnumerateRefsOfObject(Address objRef, Action<Address, int> action)
+        public override void EnumerateRefsOfObject(ulong objRef, Action<ulong, int> action)
         {
             ClrType realType = DesktopHeap.GetObjectType(objRef);
             realType.EnumerateRefsOfObject(objRef, action);
@@ -385,17 +394,17 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             get { return null; } // TODO: Determine if null should be the correct return value
         }
 
-        public override int GetArrayLength(Address objRef)
+        public override int GetArrayLength(ulong objRef)
         {
             return 0;
         }
 
-        public override Address GetArrayElementAddress(Address objRef, int index)
+        public override ulong GetArrayElementAddress(ulong objRef, int index)
         {
             return 0;
         }
 
-        public override object GetArrayElementValue(Address objRef, int index)
+        public override object GetArrayElementValue(ulong objRef, int index)
         {
             return null;
         }
@@ -410,7 +419,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             get { return IntPtr.Size * 8; } //TODO GET HELP
         }
 
-        public override void EnumerateRefsOfObjectCarefully(Address objRef, Action<Address, int> action) // TODO GET HELP
+        public override void EnumerateRefsOfObjectCarefully(ulong objRef, Action<ulong, int> action) // TODO GET HELP
         {
             ClrType realType = DesktopHeap.GetObjectType(objRef);
             realType.EnumerateRefsOfObjectCarefully(objRef, action);
@@ -435,19 +444,34 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                 BuildName(nameHint);
         }
 
+        internal override ClrMethod GetMethod(uint token)
+        {
+            return null;
+        }
+
+        public override ulong MethodTable
+        {
+            get
+            {
+                // Unfortunately this is a "fake" type (we constructed it because we could not
+                // get the real type from the dac APIs).  So we have nothing we can return here.
+                return 0;
+            }
+        }
+
+        public override IEnumerable<ulong> EnumerateMethodTables()
+        {
+            return new ulong[] { MethodTable };
+        }
+
         public override ClrModule Module { get { return DesktopModule; } }
 
 
-        internal override Address GetModuleAddress(ClrAppDomain domain)
+        internal override ulong GetModuleAddress(ClrAppDomain domain)
         {
             return 0;
         }
-
-        public override int Index
-        {
-            get { return -1; }
-        }
-
+        
         public override string Name
         {
             get
@@ -530,7 +554,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             return "ARRAY";
         }
 
-        public override bool IsFinalizeSuppressed(Address obj)
+        public override bool IsFinalizeSuppressed(ulong obj)
         {
             return false;
         }
@@ -561,13 +585,13 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
         override public IList<ClrMethod> Methods { get { return new ClrMethod[0]; } }
 
-        public override Address GetSize(Address objRef)
+        public override ulong GetSize(ulong objRef)
         {
             ClrType realType = DesktopHeap.GetObjectType(objRef);
             return realType.GetSize(objRef);
         }
 
-        public override void EnumerateRefsOfObject(Address objRef, Action<Address, int> action)
+        public override void EnumerateRefsOfObject(ulong objRef, Action<ulong, int> action)
         {
             ClrType realType = DesktopHeap.GetObjectType(objRef);
             realType.EnumerateRefsOfObject(objRef, action);
@@ -645,18 +669,18 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             get { return DesktopHeap.ArrayType; }
         }
 
-        public override int GetArrayLength(Address objRef)
+        public override int GetArrayLength(ulong objRef)
         {
             //todo
             throw new NotImplementedException();
         }
 
-        public override Address GetArrayElementAddress(Address objRef, int index)
+        public override ulong GetArrayElementAddress(ulong objRef, int index)
         {
             throw new NotImplementedException();
         }
 
-        public override object GetArrayElementValue(Address objRef, int index)
+        public override object GetArrayElementValue(ulong objRef, int index)
         {
             throw new NotImplementedException();
         }
@@ -671,7 +695,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             get { return IntPtr.Size * 8; }
         }
 
-        public override void EnumerateRefsOfObjectCarefully(Address objRef, Action<Address, int> action)
+        public override void EnumerateRefsOfObjectCarefully(ulong objRef, Action<ulong, int> action)
         {
             ClrType realType = DesktopHeap.GetObjectType(objRef);
             realType.EnumerateRefsOfObjectCarefully(objRef, action);
@@ -681,6 +705,78 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
     internal class DesktopHeapType : BaseDesktopHeapType
     {
+        ulong _cachedMethodTable;
+        ulong[] _methodTables;
+
+        public override ulong MethodTable
+        {
+            get
+            {
+                if (_cachedMethodTable != 0)
+                    return _cachedMethodTable;
+
+                if (Shared || ((DesktopRuntimeBase)Heap.Runtime).IsSingleDomain)
+                    _cachedMethodTable = _constructedMT;
+                else
+                {
+                    _cachedMethodTable = EnumerateMethodTables().FirstOrDefault();
+                    if (_cachedMethodTable == 0)
+                        _cachedMethodTable = _constructedMT;
+                }
+
+                Debug.Assert(_cachedMethodTable != 0);
+                return _cachedMethodTable;
+            }
+        }
+
+        public override IEnumerable<ulong> EnumerateMethodTables()
+        {
+            if (_methodTables == null && (Shared || ((DesktopRuntimeBase)Heap.Runtime).IsSingleDomain))
+            {
+                if (_cachedMethodTable == 0)
+                {
+                    // This should never happen, but we'll check to make sure.
+                    Debug.Assert(_constructedMT != 0);
+
+                    if (_constructedMT != 0)
+                    {
+                        _cachedMethodTable = _constructedMT;
+                        _methodTables = new ulong[] { _cachedMethodTable };
+                        return _methodTables;
+                    }
+                }
+            }
+
+            return FillAndEnumerateTypeHandles();
+        }
+
+        private IEnumerable<ulong> FillAndEnumerateTypeHandles()
+        {
+            IList<ClrAppDomain> domains = null;
+            if (_methodTables == null)
+            {
+                domains = Module.AppDomains;
+                _methodTables = new ulong[domains.Count];
+            }
+            
+            for (int i = 0; i < _methodTables.Length; i++)
+            {
+                if (_methodTables[i] == 0)
+                {
+                    if (domains == null)
+                        domains = Module.AppDomains;
+
+                    ulong value = ((DesktopModule)DesktopModule).GetMTForDomain(domains[i], this);
+                    _methodTables[i] = value != 0 ? value : ulong.MaxValue;
+                }
+
+                if (_methodTables[i] == ulong.MaxValue)
+                    continue;
+
+                yield return _methodTables[i];
+            }
+        }
+
         public override ClrElementType ElementType
         {
             get
@@ -697,22 +793,18 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             }
         }
 
-        public override int Index
-        {
-            get { return _index; }
-        }
-
         public override string Name { get { return _name; } }
         public override ClrModule Module
         {
             get
             {
                 if (DesktopModule == null)
-                    return new ErrorModule();
+                    return DesktopHeap.DesktopRuntime.ErrorModule;
+
                 return DesktopModule;
             }
         }
-        public override ulong GetSize(Address objRef)
+        public override ulong GetSize(ulong objRef)
         {
             ulong size;
             uint pointerSize = (uint)DesktopHeap.PointerSize;
@@ -722,7 +814,6 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             }
             else
             {
-                uint count = 0;
                 uint countOffset = pointerSize;
                 ulong loc = objRef + countOffset;
 
@@ -734,7 +825,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                         cache = DesktopHeap.DesktopRuntime.MemoryReader;
                 }
 
-                if (!cache.ReadDword(loc, out count))
+                if (!cache.ReadDword(loc, out uint count))
                     throw new Exception("Could not read from heap at " + objRef.ToString("x"));
 
                 // Strings in v4+ contain a trailing null terminator not accounted for.
@@ -750,7 +841,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             return size;
         }
 
-        public override void EnumerateRefsOfObjectCarefully(Address objRef, Action<Address, int> action)
+        public override void EnumerateRefsOfObjectCarefully(ulong objRef, Action<ulong, int> action)
         {
             if (!_containsPointers)
                 return;
@@ -772,7 +863,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             _gcDesc.WalkObject(objRef, (ulong)size, cache, action);
         }
 
-        public override void EnumerateRefsOfObject(Address objRef, Action<Address, int> action)
+        public override void EnumerateRefsOfObject(ulong objRef, Action<ulong, int> action)
         {
             if (!_containsPointers)
                 return;
@@ -794,18 +885,16 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
         {
             DesktopRuntimeBase runtime = DesktopHeap.DesktopRuntime;
 
-            int entries;
-            if (!runtime.ReadDword(_handle - (ulong)IntPtr.Size, out entries))
+            if (!runtime.ReadDword(_constructedMT - (ulong)IntPtr.Size, out int entries))
                 return false;
 
             // Get entries in map
             if (entries < 0)
                 entries = -entries;
 
-            int read;
             int slots = 1 + entries * 2;
             byte[] buffer = new byte[slots * IntPtr.Size];
-            if (!runtime.ReadMemory(_handle - (ulong)(slots * IntPtr.Size), buffer, buffer.Length, out read) || read != buffer.Length)
+            if (!runtime.ReadMemory(_constructedMT - (ulong)(slots * IntPtr.Size), buffer, buffer.Length, out int read) || read != buffer.Length)
                 return false;
 
             // Construct the gc desc
@@ -816,11 +905,11 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
         public override ClrHeap Heap { get { return DesktopHeap; } }
         public override string ToString()
         {
-            return "<GCHeapType Name=\"" + Name + "\">";
+            return Name;
         }
 
         public override bool HasSimpleValue { get { return ElementType != ClrElementType.Struct; } }
-        public override object GetValue(Address address)
+        public override object GetValue(ulong address)
         {
             if (IsPrimitive)
                 address += (ulong)DesktopHeap.PointerSize;
@@ -846,7 +935,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
         }
 
 
-        public override bool IsCCW(Address obj)
+        public override bool IsCCW(ulong obj)
         {
             if (_checkedIfIsCCW)
                 return !_notCCW;
@@ -862,7 +951,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             return !_notCCW;
         }
 
-        public override CcwData GetCCWData(Address obj)
+        public override CcwData GetCCWData(ulong obj)
         {
             if (_notCCW)
                 return null;
@@ -889,7 +978,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             return result;
         }
 
-        public override bool IsRCW(Address obj)
+        public override bool IsRCW(ulong obj)
         {
             if (_checkedIfIsRCW)
                 return !_notRCW;
@@ -905,7 +994,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             return !_notRCW;
         }
 
-        public override RcwData GetRCWData(Address obj)
+        public override RcwData GetRCWData(ulong obj)
         {
             // Most types can't possibly be RCWs.  
             if (_notRCW)
@@ -953,8 +1042,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
         public override bool TryGetEnumValue(string name, out int value)
         {
-            object val = null;
-            if (TryGetEnumValue(name, out val))
+            if (TryGetEnumValue(name, out object val))
             {
                 value = (int)val;
                 return true;
@@ -978,8 +1066,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             if (_enumData == null)
                 InitEnumData();
 
-            string result = null;
-            _enumData.ValueToName.TryGetValue(value, out result);
+            _enumData.ValueToName.TryGetValue(value, out string result);
             return result;
         }
 
@@ -1004,7 +1091,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                 throw new InvalidOperationException("Type is not an Enum.");
 
             _enumData = new EnumData();
-            IMetadata import = null;
+            ICorDebug.IMetadataImport import = null;
             if (DesktopModule != null)
                 import = DesktopModule.GetMetadataImport();
 
@@ -1024,19 +1111,14 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                 int res = import.EnumFields(ref hnd, (int)_token, fields, fields.Length, out tokens);
                 for (int i = 0; i < tokens; ++i)
                 {
-                    FieldAttributes attr;
-                    int mdTypeDef, pchField, pcbSigBlob, pdwCPlusTypeFlag, pcchValue;
-                    IntPtr ppvSigBlob, ppValue = IntPtr.Zero;
                     StringBuilder builder = new StringBuilder(256);
-
-                    res = import.GetFieldProps(fields[i], out mdTypeDef, builder, builder.Capacity, out pchField, out attr, out ppvSigBlob, out pcbSigBlob, out pdwCPlusTypeFlag, out ppValue, out pcchValue);
+                    res = import.GetFieldProps(fields[i], out int mdTypeDef, builder, builder.Capacity, out int pchField, out FieldAttributes attr, out IntPtr ppvSigBlob, out int pcbSigBlob, out int pdwCPlusTypeFlag, out IntPtr ppValue, out int pcchValue);
 
                     if ((int)attr == 0x606 && builder.ToString() == "value__")
                     {
                         SigParser parser = new SigParser(ppvSigBlob, pcbSigBlob);
-                        int sigType, elemType;
 
-                        if (parser.GetCallingConvInfo(out sigType) && parser.GetElemType(out elemType))
+                        if (parser.GetCallingConvInfo(out int sigType) && parser.GetElemType(out int elemType))
                             _enumData.ElementType = (ClrElementType)elemType;
                     }
 
@@ -1047,11 +1129,9 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                         string name = builder.ToString();
                         names.Add(name);
 
-                        int ccinfo;
                         SigParser parser = new SigParser(ppvSigBlob, pcbSigBlob);
-                        parser.GetCallingConvInfo(out ccinfo);
-                        int elemType;
-                        parser.GetElemType(out elemType);
+                        parser.GetCallingConvInfo(out int ccinfo);
+                        parser.GetElemType(out int elemType);
 
                         Type type = ClrRuntime.GetTypeForElementType((ClrElementType)pdwCPlusTypeFlag);
                         if (type != null)
@@ -1100,15 +1180,14 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
         {
             get
             {
-                return this == DesktopHeap.FreeType;
+                return this == DesktopHeap.Free;
             }
         }
 
         private const uint FinalizationSuppressedFlag = 0x40000000;
-        public override bool IsFinalizeSuppressed(Address obj)
+        public override bool IsFinalizeSuppressed(ulong obj)
         {
-            uint value;
-            bool result = DesktopHeap.GetObjectHeader(obj, out value);
+            bool result = DesktopHeap.GetObjectHeader(obj, out uint value);
 
             return result && (value & FinalizationSuppressedFlag) == FinalizationSuppressedFlag;
         }
@@ -1136,7 +1215,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             }
         }
 
-        public override bool IsArray { get { return _componentSize != 0 && this != DesktopHeap.StringType && this != DesktopHeap.FreeType; } }
+        public override bool IsArray { get { return _componentSize != 0 && this != DesktopHeap.StringType && this != DesktopHeap.Free; } }
         public override bool ContainsPointers { get { return _containsPointers; } }
         public override bool IsString { get { return this == DesktopHeap.StringType; } }
 
@@ -1221,7 +1300,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                 return;
 
             DesktopRuntimeBase runtime = DesktopHeap.DesktopRuntime;
-            IFieldInfo fieldInfo = runtime.GetFieldInfo(_handle);
+            IFieldInfo fieldInfo = runtime.GetFieldInfo(_constructedMT);
 
             if (fieldInfo == null)
             {
@@ -1243,7 +1322,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             ulong nextField = fieldInfo.FirstField;
             int i = 0;
 
-            IMetadata import = null;
+            ICorDebug.IMetadataImport import = null;
             if (nextField != 0 && DesktopModule != null)
                 import = DesktopModule.GetMetadataImport();
 
@@ -1254,9 +1333,9 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                     break;
 
                 // We don't handle context statics.
-                if (field.bIsContextLocal)
+                if (field.IsContextLocal)
                 {
-                    nextField = field.nextField;
+                    nextField = field.NextField;
                     continue;
                 }
 
@@ -1269,10 +1348,9 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
                 if (import != null)
                 {
-                    int mdTypeDef, pchField, pdwCPlusTypeFlab;
                     StringBuilder builder = new StringBuilder(256);
 
-                    int res = import.GetFieldProps((int)field.FieldToken, out mdTypeDef, builder, builder.Capacity, out pchField, out attr, out fieldSig, out sigLen, out pdwCPlusTypeFlab, out ppValue, out pcchValue);
+                    int res = import.GetFieldProps((int)field.FieldToken, out int mdTypeDef, builder, builder.Capacity, out int pchField, out attr, out fieldSig, out sigLen, out int pdwCPlusTypeFlab, out ppValue, out pcchValue);
                     if (res >= 0)
                         name = builder.ToString();
                     else
@@ -1294,7 +1372,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                     // TODO:  Renable when thread statics are fixed.
                     //m_threadStatics.Add(new RealTimeMemThreadStaticField(m_heap, field, name));
                 }
-                else if (field.bIsStatic)
+                else if (field.IsStatic)
                 {
                     if (_statics == null)
                         _statics = new List<ClrStaticField>();
@@ -1316,76 +1394,16 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                 }
 
                 i++;
-                nextField = field.nextField;
+                nextField = field.NextField;
             }
 
             _fields.Sort((a, b) => a.Offset.CompareTo(b.Offset));
         }
-
-        [Obsolete()]
-        public override bool TryGetFieldValue(ulong obj, ICollection<string> fields, out object value)
+        
+        internal override ClrMethod GetMethod(uint token)
         {
-            // todo:  There's probably a better way of implementing GetFieldValue/TryGetFieldValue
-            //        than simply wrapping this in a try/catch.
-            try
-            {
-                value = GetFieldValue(obj, fields);
-                return true;
-            }
-            catch
-            {
-                value = null;
-                return false;
-            }
+            return Methods.Where(m => m.MetadataToken == token).FirstOrDefault();
         }
-
-        [Obsolete()]
-        public override object GetFieldValue(ulong obj, ICollection<string> fields)
-        {
-            ClrType type = this;
-            ClrInstanceField field = null;
-
-            object value = obj;
-            bool inner = false;
-
-            int i = 0;
-            int lastElement = fields.Count - 1;
-            foreach (string name in fields)
-            {
-                if (type == null)
-                    throw new Exception(string.Format("Could not get type information for field {0}.", name));
-
-                field = type.GetFieldByName(name);
-                if (field == null)
-                    throw new Exception(string.Format("Type {0} does not contain field {1}.", type.Name, name));
-
-                if (field.HasSimpleValue)
-                {
-                    value = field.GetValue((ulong)value, inner);
-                    if (i != lastElement)
-                    {
-                        if (DesktopRuntimeBase.IsObjectReference(field.ElementType))
-                            obj = (ulong)value;
-                        else
-                            throw new Exception(string.Format("Field {0}.{1} is not an object reference.", type.Name, name));
-                    }
-
-                    inner = false;
-                }
-                else
-                {
-                    obj = field.GetAddress(obj, inner);
-                    value = obj;
-                    inner = true;
-                }
-
-                type = field.Type;
-                i++;
-            }
-
-            return value;
-        }
-
 
         public override IList<ClrMethod> Methods
         {
@@ -1394,12 +1412,12 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                 if (_methods != null)
                     return _methods;
 
-                IMetadata metadata = null;
+                ICorDebug.IMetadataImport metadata = null;
                 if (DesktopModule != null)
                     metadata = DesktopModule.GetMetadataImport();
 
                 DesktopRuntimeBase runtime = DesktopHeap.DesktopRuntime;
-                IList<ulong> mdList = runtime.GetMethodDescList(_handle);
+                IList<ulong> mdList = runtime.GetMethodDescList(_constructedMT);
 
                 if (mdList != null)
                 {
@@ -1480,22 +1498,21 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                 if (_parent == 0)
                     return null;
 
-                return DesktopHeap.GetGCHeapType(_parent, 0, 0);
+                return DesktopHeap.GetTypeByMethodTable(_parent, 0, 0);
             }
         }
 
-        public override int GetArrayLength(Address objRef)
+        public override int GetArrayLength(ulong objRef)
         {
             Debug.Assert(IsArray);
 
-            uint res;
-            if (!DesktopHeap.DesktopRuntime.ReadDword(objRef + (uint)DesktopHeap.DesktopRuntime.PointerSize, out res))
+            if (!DesktopHeap.DesktopRuntime.ReadDword(objRef + (uint)DesktopHeap.DesktopRuntime.PointerSize, out uint res))
                 res = 0;
 
             return (int)res;
         }
 
-        public override Address GetArrayElementAddress(Address objRef, int index)
+        public override ulong GetArrayElementAddress(ulong objRef, int index)
         {
             if (_baseArrayOffset == 0)
             {
@@ -1509,10 +1526,10 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                 }
                 else if (componentType != null)
                 {
-                    if (componentType.IsObjectReference)
-                        _baseArrayOffset = IntPtr.Size * 3;
-                    else
+                    if (!componentType.IsObjectReference || !Heap.Runtime.HasArrayComponentMethodTables)
                         _baseArrayOffset = IntPtr.Size * 2;
+                    else
+                        _baseArrayOffset = IntPtr.Size * 3;
                 }
                 else
                 {
@@ -1520,10 +1537,10 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                 }
             }
 
-            return objRef + (Address)(_baseArrayOffset + index * _componentSize);
+            return objRef + (ulong)(_baseArrayOffset + index * _componentSize);
         }
 
-        public override object GetArrayElementValue(Address objRef, int index)
+        public override object GetArrayElementValue(ulong objRef, int index)
         {
             ulong addr = GetArrayElementAddress(objRef, index);
             if (addr == 0)
@@ -1721,13 +1738,12 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             return builder.ToString();
         }
 
-        internal DesktopHeapType(string typeName, DesktopModule module, uint token, ulong mt, IMethodTableData mtData, DesktopGCHeap heap, int index)
+        internal DesktopHeapType(string typeName, DesktopModule module, uint token, ulong mt, IMethodTableData mtData, DesktopGCHeap heap)
             : base(heap, module, token)
         {
             _name = typeName;
-            _index = index;
 
-            _handle = mt;
+            _constructedMT = mt;
             Shared = mtData.Shared;
             _parent = mtData.Parent;
             _baseSize = mtData.BaseSize;
@@ -1735,22 +1751,25 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             _containsPointers = mtData.ContainsPointers;
             _hasMethods = mtData.NumMethods > 0;
         }
+        
+        internal void SetIndex(int index)
+        {
+            _index = index;
+        }
 
         private void InitFlags()
         {
             if ((int)_attributes != 0 || DesktopModule == null)
                 return;
 
-            IMetadata import = DesktopModule.GetMetadataImport();
+            ICorDebug.IMetadataImport import = DesktopModule.GetMetadataImport();
             if (import == null)
             {
                 _attributes = (TypeAttributes)0x70000000;
                 return;
             }
 
-            int tdef;
-            int extends;
-            int i = import.GetTypeDefProps((int)_token, null, 0, out tdef, out _attributes, out extends);
+            int i = import.GetTypeDefProps((int)_token, null, 0, out int tdef, out _attributes, out int extends);
             if (i < 0 || (int)_attributes == 0)
                 _attributes = (TypeAttributes)0x70000000;
         }
@@ -1837,7 +1856,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
         }
 
 
-        internal override Address GetModuleAddress(ClrAppDomain appDomain)
+        internal override ulong GetModuleAddress(ClrAppDomain appDomain)
         {
             if (DesktopModule == null)
                 return 0;
@@ -1875,7 +1894,23 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                 methodTable = (ulong)(long)ptrField.GetValue(field.GetAddress(obj, false), true);
             }
 
-            return DesktopHeap.GetGCHeapType(methodTable, 0, obj);
+            return DesktopHeap.GetTypeByMethodTable(methodTable, 0, obj);
+        }
+
+        internal void InitMethodHandles()
+        {
+            var runtime = DesktopHeap.DesktopRuntime;
+            foreach (ulong methodTable in EnumerateMethodTables())
+            {
+                foreach (ulong methodDesc in runtime.GetMethodDescList(methodTable))
+                {
+                    IMethodDescData data = runtime.GetMethodDescData(methodDesc);
+                    DesktopMethod method = (DesktopMethod)GetMethod(data.MDToken);
+                    if (method.Type != this)
+                        continue;
+                    method.AddMethodHandle(methodDesc);
+                }
+            }
         }
 
         private string _name;
@@ -1883,7 +1918,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
         private TypeAttributes _attributes;
         private GCDesc _gcDesc;
-        private ulong _handle;
+        private ulong _constructedMT;
         private ulong _parent;
         private uint _baseSize;
         private uint _componentSize;

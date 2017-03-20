@@ -44,8 +44,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                         _locks[obj] = CreateRWSObject(obj, type);
 
                     // Does this object have a syncblk with monitor associated with it?
-                    uint header;
-                    if (!_heap.GetObjectHeader(obj, out header))
+                    if (!_heap.GetObjectHeader(obj, out uint header))
                         continue;
 
                     if ((header & (BIT_SBLK_IS_HASH_OR_SYNCBLKINDEX | BIT_SBLK_SPIN_LOCK)) != 0)
@@ -230,10 +229,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                         case "Join":
                             if (type.Name == "System.Threading.Thread")
                             {
-                                ulong threadAddr;
-                                ClrThread target;
-
-                                if (FindThread(thread.StackLimit, thread.StackTrace[i].StackPointer, out threadAddr, out target) ||
+                                if (FindThread(thread.StackLimit, thread.StackTrace[i].StackPointer, out ulong threadAddr, out ClrThread target) ||
                                     FindThread(thread.StackTrace[i].StackPointer, thread.StackBase, out threadAddr, out target))
                                 {
                                     if (!_joinLocks.TryGetValue(target, out blockingObj))
@@ -278,13 +274,15 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                             {
                                 if (eventTypes == null)
                                 {
-                                    eventTypes = new HashSet<string>();
-                                    eventTypes.Add("System.Threading.Mutex");
-                                    eventTypes.Add("System.Threading.Semaphore");
-                                    eventTypes.Add("System.Threading.ManualResetEvent");
-                                    eventTypes.Add("System.Threading.AutoResetEvent");
-                                    eventTypes.Add("System.Threading.WaitHandle");
-                                    eventTypes.Add("Microsoft.Win32.SafeHandles.SafeWaitHandle");
+                                    eventTypes = new HashSet<string>
+                                    {
+                                        "System.Threading.Mutex",
+                                        "System.Threading.Semaphore",
+                                        "System.Threading.ManualResetEvent",
+                                        "System.Threading.AutoResetEvent",
+                                        "System.Threading.WaitHandle",
+                                        "Microsoft.Win32.SafeHandles.SafeWaitHandle"
+                                    };
                                 }
 
                                 ulong obj = FindWaitHandle(thread.StackLimit, thread.StackTrace[i].StackPointer, eventTypes);
@@ -306,6 +304,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                         case "TryEnter":
                         case "ReliableEnterTimeout":
                         case "TryEnterTimeout":
+                        case "ReliableEnter":
                         case "Enter":
                             if (type.Name == "System.Threading.Monitor")
                             {
@@ -463,7 +462,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
         private ulong FindWaitHandle(ulong start, ulong stop, HashSet<string> eventTypes)
         {
-            ClrHeap heap = _runtime.GetHeap();
+            ClrHeap heap = _runtime.Heap;
             foreach (ulong obj in EnumerateObjectsOfTypes(start, stop, eventTypes))
                 return obj;
 
@@ -472,7 +471,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
         private ulong FindWaitObjects(ulong start, ulong stop, string typeName)
         {
-            ClrHeap heap = _runtime.GetHeap();
+            ClrHeap heap = _runtime.Heap;
             foreach (ulong obj in EnumerateObjectsOfType(start, stop, typeName))
                 return obj;
 
@@ -481,11 +480,10 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
         private IEnumerable<ulong> EnumerateObjectsOfTypes(ulong start, ulong stop, HashSet<string> types)
         {
-            ClrHeap heap = _runtime.GetHeap();
+            ClrHeap heap = _runtime.Heap;
             foreach (ulong ptr in EnumeratePointersInRange(start, stop))
             {
-                ulong obj;
-                if (_runtime.ReadPointer(ptr, out obj))
+                if (_runtime.ReadPointer(ptr, out ulong obj))
                 {
                     if (heap.IsInHeap(obj))
                     {
@@ -513,11 +511,10 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
         private IEnumerable<ulong> EnumerateObjectsOfType(ulong start, ulong stop, string typeName)
         {
-            ClrHeap heap = _runtime.GetHeap();
+            ClrHeap heap = _runtime.Heap;
             foreach (ulong ptr in EnumeratePointersInRange(start, stop))
             {
-                ulong obj;
-                if (_runtime.ReadPointer(ptr, out obj))
+                if (_runtime.ReadPointer(ptr, out ulong obj))
                 {
                     if (heap.IsInHeap(obj))
                     {
@@ -545,7 +542,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
         private bool FindThread(ulong start, ulong stop, out ulong threadAddr, out ClrThread target)
         {
-            ClrHeap heap = _runtime.GetHeap();
+            ClrHeap heap = _runtime.Heap;
             foreach (ulong obj in EnumerateObjectsOfType(start, stop, "System.Threading.Thread"))
             {
                 ClrType type = heap.GetObjectType(obj);
@@ -586,11 +583,9 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
         {
             foreach (ulong ptr in EnumeratePointersInRange(start, stop))
             {
-                ulong val = 0;
-                if (_runtime.ReadPointer(ptr, out val))
+                if (_runtime.ReadPointer(ptr, out ulong val))
                 {
-                    DesktopBlockingObject result = null;
-                    if (_locks.TryGetValue(val, out result) && isCorrectType(val, _heap.GetObjectType(val)))
+                    if (_locks.TryGetValue(val, out DesktopBlockingObject result) && isCorrectType(val, _heap.GetObjectType(val)))
                         return result;
                 }
             }
@@ -603,8 +598,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             ulong obj = 0;
             foreach (ulong ptr in EnumeratePointersInRange(start, stop))
             {
-                ulong tmp = 0;
-                if (_runtime.ReadPointer(ptr, out tmp))
+                if (_runtime.ReadPointer(ptr, out ulong tmp))
                 {
                     if (_syncblks.TryGetValue(tmp, out tmp))
                     {
@@ -614,8 +608,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                 }
             }
 
-            DesktopBlockingObject result = null;
-            if (obj != 0 && _monitors.TryGetValue(obj, out result))
+            if (obj != 0 && _monitors.TryGetValue(obj, out DesktopBlockingObject result))
                 return result;
 
             return null;

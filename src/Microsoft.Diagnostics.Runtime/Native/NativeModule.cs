@@ -4,20 +4,29 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using Address = System.UInt64;
 
 namespace Microsoft.Diagnostics.Runtime.Native
 {
     internal class NativeAppDomain : ClrAppDomain
     {
-        private IList<ClrModule> _modules;
-
-        public NativeAppDomain(IList<ClrModule> modules)
+        public override ClrRuntime Runtime
         {
+            get
+            {
+                return _runtime;
+            }
+        }
+
+        private IList<ClrModule> _modules;
+        private ClrRuntime _runtime;
+
+        public NativeAppDomain(ClrRuntime runtime, IList<ClrModule> modules)
+        {
+            _runtime = runtime;
             _modules = modules;
         }
 
-        public override Address Address
+        public override ulong Address
         {
             get { return 0; }
         }
@@ -30,7 +39,6 @@ namespace Microsoft.Diagnostics.Runtime.Native
         public override string Name
         {
             get { return "default domain"; }
-            internal set { }
         }
 
         public override IList<ClrModule> Modules
@@ -55,8 +63,9 @@ namespace Microsoft.Diagnostics.Runtime.Native
         private NativeRuntime _runtime;
         private string _name;
         private string _filename;
-        private Address _imageBase;
-        private Address _size;
+        private ulong _imageBase;
+        private ulong _size;
+        private PdbInfo _pdb;
 
         public NativeModule(NativeRuntime runtime, ModuleInfo module)
         {
@@ -65,6 +74,25 @@ namespace Microsoft.Diagnostics.Runtime.Native
             _filename = module.FileName;
             _imageBase = module.ImageBase;
             _size = module.FileSize;
+            _pdb = module.Pdb;
+        }
+
+        public override ClrRuntime Runtime
+        {
+            get
+            {
+                return _runtime;
+            }
+        }
+
+        public override PdbInfo Pdb { get { return _pdb; } }
+
+        public override IList<ClrAppDomain> AppDomains
+        {
+            get
+            {
+                return new ClrAppDomain[] { _runtime.AppDomains[0] };
+            }
         }
 
         public override string AssemblyName
@@ -92,24 +120,24 @@ namespace Microsoft.Diagnostics.Runtime.Native
             get { return _filename; }
         }
 
-        public override Address ImageBase
+        public override ulong ImageBase
         {
             get { return _imageBase; }
         }
 
-        public override Address Size
+        public override ulong Size
         {
             get { return _size; }
         }
 
         public override IEnumerable<ClrType> EnumerateTypes()
         {
-            foreach (var type in _runtime.GetHeap().EnumerateTypes())
+            foreach (var type in _runtime.Heap.EnumerateTypes())
                 if (type.Module == this)
                     yield return type;
         }
 
-        internal int ComparePointer(Address eetype)
+        internal int ComparePointer(ulong eetype)
         {
             if (eetype < ImageBase)
                 return -1;
@@ -120,12 +148,12 @@ namespace Microsoft.Diagnostics.Runtime.Native
             return 0;
         }
 
-        public override Address MetadataAddress
+        public override ulong MetadataAddress
         {
             get { throw new NotImplementedException(); }
         }
 
-        public override Address MetadataLength
+        public override ulong MetadataLength
         {
             get { throw new NotImplementedException(); }
         }
@@ -145,7 +173,7 @@ namespace Microsoft.Diagnostics.Runtime.Native
             throw new NotImplementedException();
         }
 
-        public override Address AssemblyId
+        public override ulong AssemblyId
         {
             get { throw new NotImplementedException(); }
         }

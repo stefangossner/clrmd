@@ -3,7 +3,6 @@
 
 using System;
 using System.Collections.Generic;
-using Address = System.UInt64;
 
 namespace Microsoft.Diagnostics.Runtime.Native
 {
@@ -39,7 +38,7 @@ namespace Microsoft.Diagnostics.Runtime.Native
 
         public NativeHandleRootWalker(NativeRuntime runtime, bool dependentHandleSupport)
         {
-            _heap = runtime.GetHeap();
+            _heap = runtime.Heap;
             _domain = runtime.GetRhAppDomain();
             _dependentSupport = dependentHandleSupport;
         }
@@ -81,7 +80,7 @@ namespace Microsoft.Diagnostics.Runtime.Native
         {
             Roots = new List<ClrRoot>(128);
             _runtime = resolveStatics ? runtime : null;
-            _heap = _runtime.GetHeap();
+            _heap = _runtime.Heap;
         }
 
         public void Callback(IntPtr token, ulong addr, ulong obj, int pinned, int interior)
@@ -199,17 +198,17 @@ namespace Microsoft.Diagnostics.Runtime.Native
         }
 
 
-        public NativeHandleRoot(Address addr, Address obj, Address dependentTarget, ClrType type, int hndType, ClrAppDomain domain, string name)
+        public NativeHandleRoot(ulong addr, ulong obj, ulong dependentTarget, ClrType type, int hndType, ClrAppDomain domain, string name)
         {
             Init(addr, obj, dependentTarget, type, hndType, domain, name);
         }
 
-        public NativeHandleRoot(Address addr, Address obj, ClrType type, int hndType, ClrAppDomain domain, string name)
+        public NativeHandleRoot(ulong addr, ulong obj, ClrType type, int hndType, ClrAppDomain domain, string name)
         {
             Init(addr, obj, 0, type, hndType, domain, name);
         }
 
-        private void Init(Address addr, Address obj, Address dependentTarget, ClrType type, int hndType, ClrAppDomain domain, string name)
+        private void Init(ulong addr, ulong obj, ulong dependentTarget, ClrType type, int hndType, ClrAppDomain domain, string name)
         {
             HandleType htype = (HandleType)hndType;
             switch (htype)
@@ -295,7 +294,7 @@ namespace Microsoft.Diagnostics.Runtime.Native
             }
         }
 
-        public NativeStaticVar(NativeRuntime runtime, Address addr, Address obj, ClrType type, string name, bool pinned, bool interior)
+        public NativeStaticVar(NativeRuntime runtime, ulong addr, ulong obj, ClrType type, string name, bool pinned, bool interior)
         {
             Address = addr;
             Object = obj;
@@ -303,7 +302,7 @@ namespace Microsoft.Diagnostics.Runtime.Native
             _name = name;
             _pinned = pinned;
             _interior = interior;
-            _type = runtime.GetHeap().GetObjectType(obj);
+            _type = runtime.Heap.GetObjectType(obj);
             _appDomain = runtime.GetRhAppDomain();
         }
     }

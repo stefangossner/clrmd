@@ -4,10 +4,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.IO;
-using System.Threading;
-using Microsoft.Diagnostics.Runtime.Utilities;
-using Address = System.UInt64;
+using Microsoft.Diagnostics.Runtime.Desktop;
 
 namespace Microsoft.Diagnostics.Runtime
 {
@@ -20,17 +17,67 @@ namespace Microsoft.Diagnostics.Runtime
         /// <summary>
         /// And the ability to take an address of an object and fetch its type (The type alows further exploration)
         /// </summary>
-        abstract public ClrType GetObjectType(Address objRef);
+        abstract public ClrType GetObjectType(ulong objRef);
+
+        /// <summary>
+        /// Returns whether this version of CLR has component MethodTables.  Component MethodTables were removed from
+        /// desktop CLR in v4.6, and do not exist at all on .Net Native.  If this method returns false, all component
+        /// MethodTables will be 0, and expected to be 0 when an argument to a function.
+        /// </summary>
+        virtual public bool HasComponentMethodTables { get { return true; } }
+
+        /// <summary>
+        /// Attempts to retrieve the MethodTable and component MethodTable from the given object.
+        /// Note that this some ClrTypes cannot be uniquely determined by MethodTable alone.  In
+        /// Desktop CLR (prior to v4.6), arrays of reference types all use the same MethodTable but
+        /// also carry a second MethodTable (called the component MethodTable) to determine the
+        /// array element types. Note this function has undefined behavior if you do not pass a
+        /// valid object reference to it.
+        /// </summary>
+        /// <param name="obj">The object to get the MethodTable of.</param>
+        /// <param name="methodTable">The MethodTable for the given object.</param>
+        /// <param name="componentMethodTable">The component MethodTable of the given object.</param>
+        /// <returns>True if methodTable was filled, false if we failed to read memory.</returns>
+        abstract public bool TryGetMethodTable(ulong obj, out ulong methodTable, out ulong componentMethodTable);
+
+        /// <summary>
+        /// Attempts to retrieve the MethodTable from the given object.
+        /// Note that this some ClrTypes cannot be uniquely determined by MethodTable alone.  In
+        /// Desktop CLR, arrays of reference types all use the same MethodTable.  To uniquely
+        /// determine an array of referneces you must also have its component type.
+        /// Note this function has undefined behavior if you do not pass a valid object reference
+        /// to it.
+        /// </summary>
+        /// <param name="obj">The object to get the MethodTablee of.</param>
+        /// <returns>The MethodTable of the object, or 0 if the address could not be read from.</returns>
+        abstract public ulong GetMethodTable(ulong obj);
+
+        /// <summary>
+        /// Retrieves the EEClass from the given MethodTable.  EEClasses do not exist on
+        /// .Net Native. 
+        /// </summary>
+        /// <param name="methodTable">The MethodTable to get the EEClass from.</param>
+        /// <returns>The EEClass for the given MethodTable, 0 if methodTable is invalid or
+        /// does not exist.</returns>
+        virtual public ulong GetEEClassByMethodTable(ulong methodTable) { return 0; }
+
+        /// <summary>
+        /// Retrieves the MethodTable associated with the given EEClass.
+        /// </summary>
+        /// <param name="eeclass">The eeclass to get the method table from.</param>
+        /// <returns>The MethodTable for the given EEClass, 0 if eeclass is invalid
+        /// or does not exist.</returns>
+        virtual public ulong GetMethodTableByEEClass(ulong eeclass) { return 0; }
 
         /// <summary>
         /// Returns a  wrapper around a System.Exception object (or one of its subclasses).
         /// </summary>
-        virtual public ClrException GetExceptionObject(Address objRef) { return null; }
+        virtual public ClrException GetExceptionObject(ulong objRef) { return null; }
 
         /// <summary>
         /// Returns the runtime associated with this heap.
         /// </summary>
-        virtual public ClrRuntime GetRuntime() { return null; }
+        abstract public ClrRuntime Runtime { get; }
 
         /// <summary>
         /// A heap is has a list of contiguous memory regions called segments.  This list is returned in order of
@@ -45,13 +92,6 @@ namespace Microsoft.Diagnostics.Runtime
         abstract public IEnumerable<ClrRoot> EnumerateRoots();
 
         /// <summary>
-        /// Returns a type by its index.
-        /// </summary>
-        /// <param name="index">The type to get.</param>
-        /// <returns>The ClrType of that index.</returns>
-        abstract public ClrType GetTypeByIndex(int index);
-
-        /// <summary>
         /// Looks up a type by name.
         /// </summary>
         /// <param name="name">The name of the type.</param>
@@ -60,9 +100,28 @@ namespace Microsoft.Diagnostics.Runtime
         abstract public ClrType GetTypeByName(string name);
 
         /// <summary>
-        /// Returns the max index.
+        /// Retrieves the given type by its MethodTable/ComponentMethodTable pair.
         /// </summary>
-        abstract public int TypeIndexLimit { get; }
+        /// <param name="methodTable">The ClrType.MethodTable for the requested type.</param>
+        /// <param name="componentMethodTable">The ClrType's component MethodTable for the requested type.</param>
+        /// <returns>A ClrType object, or null if no such type exists.</returns>
+        abstract public ClrType GetTypeByMethodTable(ulong methodTable, ulong componentMethodTable);
+
+        /// <summary>
+        /// Retrieves the given type by its MethodTable/ComponentMethodTable pair.  Note this is only valid if
+        /// the given type's component MethodTable is 0.
+        /// </summary>
+        /// <param name="methodTable">The ClrType.MethodTable for the requested type.</param>
+        /// <returns>A ClrType object, or null if no such type exists.</returns>
+        virtual public ClrType GetTypeByMethodTable(ulong methodTable)
+        {
+            return GetTypeByMethodTable(methodTable, 0);
+        }
+
+        /// <summary>
+        /// Returns the ClrType representing free space on the GC heap.
+        /// </summary>
+        public abstract ClrType Free { get; }
 
         /// <summary>
         /// Enumerate the roots in the process.
@@ -84,7 +143,7 @@ namespace Microsoft.Diagnostics.Runtime
         /// <summary>
         /// Enumerates all finalizable objects on the heap.
         /// </summary>
-        virtual public IEnumerable<Address> EnumerateFinalizableObjects() { throw new NotImplementedException(); }
+        virtual public IEnumerable<ulong> EnumerateFinalizableObjectAddresses() { throw new NotImplementedException(); }
 
         /// <summary>
         /// Enumerates all managed locks in the process.  That is anything using System.Monitor either explictly
@@ -107,7 +166,7 @@ namespace Microsoft.Diagnostics.Runtime
         /// for easier use in linq queries.
         /// </summary>
         /// <returns>An enumerator for all objects on the heap.</returns>
-        abstract public IEnumerable<Address> EnumerateObjects();
+        abstract public IEnumerable<ulong> EnumerateObjectAddresses();
 
         /// <summary>
         /// TotalHeapSize is defined as the sum of the length of all segments.  
@@ -123,7 +182,7 @@ namespace Microsoft.Diagnostics.Runtime
         /// <summary>
         /// Returns the generation of an object.
         /// </summary>
-        public int GetGeneration(Address obj)
+        public int GetGeneration(ulong obj)
         {
             ClrSegment seg = GetSegmentByAddress(obj);
             if (seg == null)
@@ -149,12 +208,12 @@ namespace Microsoft.Diagnostics.Runtime
         /// <summary>
         /// Returns the GC segment for the given object.
         /// </summary>
-        public abstract ClrSegment GetSegmentByAddress(Address objRef);
+        public abstract ClrSegment GetSegmentByAddress(ulong objRef);
 
         /// <summary>
         /// Returns true if the given address resides somewhere on the managed heap.
         /// </summary>
-        public bool IsInHeap(Address address) { return GetSegmentByAddress(address) != null; }
+        public bool IsInHeap(ulong address) { return GetSegmentByAddress(address) != null; }
 
         /// <summary>
         /// Pointer size of on the machine (4 or 8 bytes).  
@@ -175,7 +234,7 @@ namespace Microsoft.Diagnostics.Runtime
         /// <summary>
         /// Read 'count' bytes from the ClrHeap at 'address' placing it in 'buffer' starting at offset 'offset'
         /// </summary>
-        virtual public int ReadMemory(Address address, byte[] buffer, int offset, int count) { return 0; }
+        virtual public int ReadMemory(ulong address, byte[] buffer, int offset, int count) { return 0; }
 
         /// <summary>
         /// Attempts to efficiently read a pointer from memory.  This acts exactly like ClrRuntime.ReadPointer, but
@@ -184,7 +243,7 @@ namespace Microsoft.Diagnostics.Runtime
         /// <param name="addr">The address to read.</param>
         /// <param name="value">The pointer value.</param>
         /// <returns>True if we successfully read the value, false if addr is not mapped into the process space.</returns>
-        public abstract bool ReadPointer(Address addr, out Address value);
+        public abstract bool ReadPointer(ulong addr, out ulong value);
     }
 
     /// <summary>
@@ -195,7 +254,7 @@ namespace Microsoft.Diagnostics.Runtime
         /// <summary>
         /// The object associated with the lock.
         /// </summary>
-        abstract public Address Object { get; }
+        abstract public ulong Object { get; }
 
         /// <summary>
         /// Whether or not the object is currently locked.
@@ -309,12 +368,12 @@ namespace Microsoft.Diagnostics.Runtime
         /// <summary>
         /// The object on the GC heap that this root keeps alive.
         /// </summary>
-        virtual public Address Object { get; protected set; }
+        virtual public ulong Object { get; protected set; }
 
         /// <summary>
         /// The address of the root in the target process.
         /// </summary>
-        virtual public Address Address { get; protected set; }
+        virtual public ulong Address { get; protected set; }
 
         /// <summary>
         /// If the root can be identified as belonging to a particular AppDomain this is that AppDomain.
@@ -345,6 +404,12 @@ namespace Microsoft.Diagnostics.Runtime
         /// </summary>
         virtual public bool IsPossibleFalsePositive { get { return false; } }
 
+
+        /// <summary>
+        /// Returns the stack frame associated with this stack root.
+        /// </summary>
+        virtual public ClrStackFrame StackFrame { get { return null; } }
+
         /// <summary>
         /// Returns a string representation of this object.
         /// </summary>
@@ -365,12 +430,12 @@ namespace Microsoft.Diagnostics.Runtime
         /// <summary>
         /// The start address of the segment.  All objects in this segment fall within Start &lt;= object &lt; End.
         /// </summary>
-        abstract public Address Start { get; }
+        abstract public ulong Start { get; }
 
         /// <summary>
         /// The end address of the segment.  All objects in this segment fall within Start &lt;= object &lt; End.
         /// </summary>
-        abstract public Address End { get; }
+        abstract public ulong End { get; }
 
         /// <summary>
         /// The number of bytes in the segment.
@@ -394,37 +459,25 @@ namespace Microsoft.Diagnostics.Runtime
         /// <summary>
         /// The address of the end of memory reserved for the segment, but not committed.
         /// </summary>
-        [Obsolete("Use ReservedEnd instead", false)]
-        virtual public Address Reserved { get { return ReservedEnd; } }
+        virtual public ulong ReservedEnd { get { return 0; } }
 
         /// <summary>
         /// The address of the end of memory committed for the segment (this may be longer than Length).
         /// </summary>
-        [Obsolete("Use CommittedEnd instead", false)]
-        virtual public Address Committed { get { return CommittedEnd; } }
-
-        /// <summary>
-        /// The address of the end of memory reserved for the segment, but not committed.
-        /// </summary>
-        virtual public Address ReservedEnd { get { return 0; } }
-
-        /// <summary>
-        /// The address of the end of memory committed for the segment (this may be longer than Length).
-        /// </summary>
-        virtual public Address CommittedEnd { get { return 0; } }
+        virtual public ulong CommittedEnd { get { return 0; } }
 
         /// <summary>
         /// If it is possible to move from one object to the 'next' object in the segment. 
         /// Then FirstObject returns the first object in the heap (or null if it is not
         /// possible to walk the heap.
         /// </summary>
-        virtual public Address FirstObject { get { return 0; } }
+        virtual public ulong FirstObject { get { return 0; } }
 
         /// <summary>
         /// Given an object on the segment, return the 'next' object in the segment.  Returns
         /// 0 when there are no more objects.   (Or enumeration is not possible)  
         /// </summary>
-        virtual public Address NextObject(Address objRef) { return 0; }
+        virtual public ulong NextObject(ulong objRef) { return 0; }
 
         /// <summary>
         /// Returns true if this is a segment for the Large Object Heap.  False otherwise.
@@ -434,22 +487,10 @@ namespace Microsoft.Diagnostics.Runtime
         virtual public bool IsLarge { get { return false; } }
 
         /// <summary>
-        /// Obsolete
-        /// </summary>
-        [Obsolete("Use IsLarge instead.")]
-        virtual public bool Large { get { return IsLarge; } }
-
-        /// <summary>
         /// Returns true if this segment is the ephemeral segment (meaning it contains gen0 and gen1
         /// objects).
         /// </summary>
         virtual public bool IsEphemeral { get { return false; } }
-
-        /// <summary>
-        /// Obsolete.
-        /// </summary>
-        [Obsolete("Use IsEphemeral instead.")]
-        virtual public bool Ephemeral { get { return IsEphemeral; } }
 
         /// <summary>
         /// Ephemeral heap sements have geneation 0 and 1 in them.  Gen 1 is always above Gen 2 and
@@ -457,7 +498,7 @@ namespace Microsoft.Diagnostics.Runtime
         /// if this is not an Ephemeral segment, then this will return End (which makes Gen 0 empty
         /// for this segment)
         /// </summary>
-        virtual public Address Gen0Start { get { return Start; } }
+        virtual public ulong Gen0Start { get { return Start; } }
 
         /// <summary>
         /// The length of the gen0 portion of this segment.
@@ -467,7 +508,7 @@ namespace Microsoft.Diagnostics.Runtime
         /// <summary>
         /// The start of the gen1 portion of this segment.
         /// </summary>
-        virtual public Address Gen1Start { get { return End; } }
+        virtual public ulong Gen1Start { get { return End; } }
 
         /// <summary>
         /// The length of the gen1 portion of this segment.
@@ -477,7 +518,7 @@ namespace Microsoft.Diagnostics.Runtime
         /// <summary>
         /// The start of the gen2 portion of this segment.
         /// </summary>
-        virtual public Address Gen2Start { get { return End; } }
+        virtual public ulong Gen2Start { get { return End; } }
 
         /// <summary>
         /// The length of the gen2 portion of this segment.
@@ -487,7 +528,7 @@ namespace Microsoft.Diagnostics.Runtime
         /// <summary>
         /// Enumerates all objects on the segment.
         /// </summary>
-        abstract public IEnumerable<ulong> EnumerateObjects();
+        abstract public IEnumerable<ulong> EnumerateObjectAddresses();
 
         /// <summary>
         /// Returns the generation of an object in this segment.
@@ -496,7 +537,7 @@ namespace Microsoft.Diagnostics.Runtime
         /// <returns>The generation of the given object if that object lies in this segment.  The return
         ///          value is undefined if the object does not lie in this segment.
         /// </returns>
-        virtual public int GetGeneration(Address obj)
+        virtual public int GetGeneration(ulong obj)
         {
             if (Gen0Start <= obj && obj < (Gen0Start + Gen0Length))
             {
@@ -624,6 +665,360 @@ namespace Microsoft.Diagnostics.Runtime
         /// In Preemptive mode the runtime is free to suspend the thread at any time for a GC to occur.
         /// </summary>
         Preemptive
+    }
+
+    internal abstract class HeapBase : ClrHeap
+    {
+        private ulong _minAddr;          // Smallest and largest segment in the GC heap.  Used to make SegmentForObject faster.  
+        private ulong _maxAddr;
+        private ClrSegment[] _segments;
+        private ulong[] _sizeByGen = new ulong[4];
+        private ulong _totalHeapSize;
+        private int _lastSegmentIdx;       // The last segment we looked at.
+        private bool _canWalkHeap;
+        private int _pointerSize;
+
+        public HeapBase(RuntimeBase runtime)
+        {
+            _canWalkHeap = runtime.CanWalkHeap;
+            MemoryReader = new MemoryReader(runtime.DataReader, 0x10000);
+            _pointerSize = runtime.PointerSize;
+        }
+
+        public override ulong GetMethodTable(ulong obj)
+        {
+            if (MemoryReader.ReadPtr(obj, out ulong mt))
+                return mt;
+
+            return 0;
+        }
+
+        public override bool ReadPointer(ulong addr, out ulong value)
+        {
+            if (MemoryReader.Contains(addr))
+                return MemoryReader.ReadPtr(addr, out value);
+
+            return Runtime.ReadPointer(addr, out value);
+        }
+
+        internal int Revision { get; set; }
+
+        protected abstract int GetRuntimeRevision();
+
+        public override int PointerSize
+        {
+            get
+            {
+                return _pointerSize;
+            }
+        }
+
+        public override bool CanWalkHeap
+        {
+            get
+            {
+                return _canWalkHeap;
+            }
+        }
+
+        public override IList<ClrSegment> Segments
+        {
+            get
+            {
+                if (Revision != GetRuntimeRevision())
+                    ClrDiagnosticsException.ThrowRevisionError(Revision, GetRuntimeRevision());
+                return _segments;
+            }
+        }
+        public override ulong TotalHeapSize
+        {
+            get { return _totalHeapSize; }
+        }
+
+        public override ulong GetSizeByGen(int gen)
+        {
+            Debug.Assert(gen >= 0 && gen < 4);
+            return _sizeByGen[gen];
+        }
+
+        public override ClrType GetTypeByName(string name)
+        {
+            foreach (var module in Runtime.Modules)
+            {
+                var type = module.GetTypeByName(name);
+                if (type != null)
+                    return type;
+            }
+
+            return null;
+        }
+
+        internal MemoryReader MemoryReader { get; private set; }
+
+        protected void UpdateSegmentData(HeapSegment segment)
+        {
+            _totalHeapSize += segment.Length;
+            _sizeByGen[0] += segment.Gen0Length;
+            _sizeByGen[1] += segment.Gen1Length;
+            if (!segment.IsLarge)
+                _sizeByGen[2] += segment.Gen2Length;
+            else
+                _sizeByGen[3] += segment.Gen2Length;
+        }
+
+        protected void InitSegments(RuntimeBase runtime)
+        {
+            // Populate segments
+            if (runtime.GetHeaps(out SubHeap[] heaps))
+            {
+                var segments = new List<HeapSegment>();
+                foreach (var heap in heaps)
+                {
+                    if (heap != null)
+                    {
+                        ISegmentData seg = runtime.GetSegmentData(heap.FirstLargeSegment);
+                        while (seg != null)
+                        {
+                            var segment = new HeapSegment(runtime, seg, heap, true, this);
+                            segments.Add(segment);
+
+                            UpdateSegmentData(segment);
+                            seg = runtime.GetSegmentData(seg.Next);
+                        }
+
+                        seg = runtime.GetSegmentData(heap.FirstSegment);
+                        while (seg != null)
+                        {
+                            var segment = new HeapSegment(runtime, seg, heap, false, this);
+                            segments.Add(segment);
+
+                            UpdateSegmentData(segment);
+                            seg = runtime.GetSegmentData(seg.Next);
+                        }
+                    }
+                }
+
+                UpdateSegments(segments.ToArray());
+            }
+            else
+            {
+                _segments = new ClrSegment[0];
+            }
+        }
+
+        private void UpdateSegments(ClrSegment[] segments)
+        {
+            // sort the segments.  
+            Array.Sort(segments, delegate (ClrSegment x, ClrSegment y) { return x.Start.CompareTo(y.Start); });
+            _segments = segments;
+
+            _minAddr = ulong.MaxValue;
+            _maxAddr = ulong.MinValue;
+            _totalHeapSize = 0;
+            _sizeByGen = new ulong[4];
+            foreach (var gcSegment in _segments)
+            {
+                if (gcSegment.Start < _minAddr)
+                    _minAddr = gcSegment.Start;
+                if (_maxAddr < gcSegment.End)
+                    _maxAddr = gcSegment.End;
+
+                _totalHeapSize += gcSegment.Length;
+                if (gcSegment.IsLarge)
+                    _sizeByGen[3] += gcSegment.Length;
+                else
+                {
+                    _sizeByGen[2] += gcSegment.Gen2Length;
+                    _sizeByGen[1] += gcSegment.Gen1Length;
+                    _sizeByGen[0] += gcSegment.Gen0Length;
+                }
+            }
+        }
+
+
+        public override IEnumerable<ulong> EnumerateObjectAddresses()
+        {
+            if (Revision != GetRuntimeRevision())
+                ClrDiagnosticsException.ThrowRevisionError(Revision, GetRuntimeRevision());
+
+            for (int i = 0; i < _segments.Length; ++i)
+            {
+                var seg = _segments[i];
+                for (ulong obj = seg.FirstObject; obj != 0; obj = seg.NextObject(obj))
+                {
+                    _lastSegmentIdx = i;
+                    yield return obj;
+                }
+            }
+        }
+
+        public override ClrSegment GetSegmentByAddress(ulong objRef)
+        {
+            if (_minAddr <= objRef && objRef < _maxAddr)
+            {
+                // Start the segment search where you where last
+                int curIdx = _lastSegmentIdx;
+                for (;;)
+                {
+                    var segment = _segments[curIdx];
+                    var offsetInSegment = (long)(objRef - segment.Start);
+                    if (0 <= offsetInSegment)
+                    {
+                        var intOffsetInSegment = (long)offsetInSegment;
+                        if (intOffsetInSegment < (long)segment.Length)
+                        {
+                            _lastSegmentIdx = curIdx;
+                            return segment;
+                        }
+                    }
+
+                    // Get the next segment loop until you come back to where you started.  
+                    curIdx++;
+                    if (curIdx >= Segments.Count)
+                        curIdx = 0;
+                    if (curIdx == _lastSegmentIdx)
+                        break;
+                }
+            }
+            return null;
+        }
+    }
+
+
+    internal class HeapSegment : ClrSegment
+    {
+        public override int ProcessorAffinity
+        {
+            get { return _subHeap.HeapNum; }
+        }
+        public override ulong Start { get { return _segment.Start; } }
+        public override ulong End { get { return _subHeap.EphemeralSegment == _segment.Address ? _subHeap.EphemeralEnd : _segment.End; } }
+        public override ClrHeap Heap { get { return _heap; } }
+
+        public override bool IsLarge { get { return _large; } }
+
+        public override ulong ReservedEnd { get { return _segment.Reserved; } }
+        public override ulong CommittedEnd { get { return _segment.Committed; } }
+
+        public override ulong Gen0Start
+        {
+            get
+            {
+                if (IsEphemeral)
+                    return _subHeap.Gen0Start;
+                else
+                    return End;
+            }
+        }
+        public override ulong Gen0Length { get { return End - Gen0Start; } }
+        public override ulong Gen1Start
+        {
+            get
+            {
+                if (IsEphemeral)
+                    return _subHeap.Gen1Start;
+                else
+                    return End;
+            }
+        }
+        public override ulong Gen1Length { get { return Gen0Start - Gen1Start; } }
+        public override ulong Gen2Start { get { return Start; } }
+        public override ulong Gen2Length { get { return Gen1Start - Start; } }
+
+
+        public override IEnumerable<ulong> EnumerateObjectAddresses()
+        {
+            for (ulong obj = FirstObject; obj != 0; obj = NextObject(obj))
+                yield return obj;
+        }
+
+        public override ulong FirstObject
+        {
+            get
+            {
+                if (Gen2Start == End)
+                    return 0;
+                _heap.MemoryReader.EnsureRangeInCache(Gen2Start);
+                return Gen2Start;
+            }
+        }
+
+        public override ulong NextObject(ulong addr)
+        {
+            if (addr >= CommittedEnd)
+                return 0;
+
+            uint minObjSize = (uint)_clr.PointerSize * 3;
+
+            ClrType type = _heap.GetObjectType(addr);
+            if (type == null)
+                return 0;
+
+            ulong size = type.GetSize(addr);
+            size = Align(size, _large);
+            if (size < minObjSize)
+                size = minObjSize;
+
+            // Move to the next object
+            addr += size;
+
+            // Check to make sure a GC didn't cause "count" to be invalid, leading to too large
+            // of an object
+            if (addr >= End)
+                return 0;
+
+            // Ensure we aren't at the start of an alloc context
+            while (!IsLarge && _subHeap.AllocPointers.TryGetValue(addr, out ulong tmp))
+            {
+                tmp += Align(minObjSize, _large);
+
+                // Only if there's data corruption:
+                if (addr >= tmp)
+                    return 0;
+
+                // Otherwise:
+                addr = tmp;
+
+                if (addr >= End)
+                    return 0;
+            }
+
+            return addr;
+        }
+
+        #region private
+        internal static ulong Align(ulong size, bool large)
+        {
+            ulong AlignConst;
+            ulong AlignLargeConst = 7;
+
+            if (IntPtr.Size == 4)
+                AlignConst = 3;
+            else
+                AlignConst = 7;
+
+            if (large)
+                return (size + AlignLargeConst) & ~(AlignLargeConst);
+
+            return (size + AlignConst) & ~(AlignConst);
+        }
+
+        public override bool IsEphemeral { get { return _segment.Address == _subHeap.EphemeralSegment; ; } }
+        internal HeapSegment(RuntimeBase clr, ISegmentData segment, SubHeap subHeap, bool large, HeapBase heap)
+        {
+            _clr = clr;
+            _large = large;
+            _segment = segment;
+            _heap = heap;
+            _subHeap = subHeap;
+        }
+
+        private bool _large;
+        private RuntimeBase _clr;
+        private ISegmentData _segment;
+        private SubHeap _subHeap;
+        private HeapBase _heap;
+        #endregion
     }
 
 }

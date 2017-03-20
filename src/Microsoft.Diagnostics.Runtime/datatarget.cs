@@ -12,6 +12,7 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+using Microsoft.Diagnostics.Runtime.ICorDebug;
 
 namespace Microsoft.Diagnostics.Runtime
 {
@@ -70,20 +71,21 @@ namespace Microsoft.Diagnostics.Runtime
         Desktop = 0,
 
         /// <summary>
-        /// This is a reduced CLR used in other projects.
+        /// This originally was for Silverlight and other uses of "coreclr", but now
+        /// there are several flavors of coreclr, some of which are no longer supported.
         /// </summary>
+        [Obsolete]
         CoreCLR = 1,
-
-        /// <summary>
-        /// Same as .Net Native.  This is obsolete and will be removed. Use ClrFlavor.Native instead.
-        /// </summary>
-        [Obsolete("Use Native instead.")]
-        Redhawk = 2,
-
+        
         /// <summary>
         /// Used for .Net Native.
         /// </summary>
-        Native = 2
+        Native = 2,
+
+        /// <summary>
+        /// For .Net Core
+        /// </summary>
+        Core = 3
     }
 
     /// <summary>
@@ -117,55 +119,7 @@ namespace Microsoft.Diagnostics.Runtime
         /// if one could not be found.
         /// </summary>
         public string LocalMatchingDac { get { return _dacLocation; } }
-
-        /// <summary>
-        /// The location of the Dac on the local machine, if a matching Dac could be found.
-        /// If this returns null it means that no matching Dac could be found, and you will
-        /// need to make a symbol server request using DacInfo.
-        /// </summary>
-        [Obsolete]
-        public string TryGetDacLocation()
-        {
-            return _dacLocation;
-        }
-
-        /// <summary>
-        /// Attemps to download the matching dac for this runtime from the symbol server.  Note that this command
-        /// does not attempt to inspect or parse _NT_SYMBOL_PATH, so if you want to use that as a "default", you
-        /// need to add that path to the sympath parameter manually.  This function will return a local dac location
-        /// (and bypass the symbol server) if a matching dac exists locally on your computer.
-        /// </summary>
-        /// <param name="notification">A notification callback (null ok).</param>
-        /// <returns>The local path (in the cache) of the dac if found, null otherwise.</returns>
-        [Obsolete]
-        public string TryDownloadDac(ISymbolNotification notification)
-        {
-            if (_dacLocation != null)
-                return _dacLocation;
-
-            SymbolLocator locator = _dataTarget.SymbolLocator;
-            return locator.FindBinary(DacInfo, false);
-        }
-
-        /// <summary>
-        /// Attemps to download the matching dac for this runtime from the symbol server.  Note that this command
-        /// does not attempt to inspect or parse _NT_SYMBOL_PATH, so if you want to use that as a "default", you
-        /// need to add that path to the sympath parameter manually.  This function will return a local dac location
-        /// (and bypass the symbol server) if a matching dac exists locally on your computer.
-        /// </summary>
-        /// <returns>The local path (in the cache) of the dac if found, null otherwise.</returns>
-        [Obsolete("Use DataTarget.SymbolLocator.DownloadBinary(DacInfo) instead, or ignore this and use ClrInfo.CreateRuntime() with no parameters.")]
-        public string TryDownloadDac()
-        {
-            if (_dacLocation != null)
-                return _dacLocation;
-
-            SymbolLocator locator = _dataTarget.SymbolLocator;
-            ModuleInfo dac = DacInfo;
-
-            return locator.FindBinary(dac.FileName, dac.TimeStamp, dac.FileSize, false);
-        }
-
+        
         /// <summary>
         /// Creates a runtime from the given Dac file on disk.
         /// </summary>
@@ -227,8 +181,7 @@ namespace Microsoft.Diagnostics.Runtime
 
             if (!ignoreMismatch)
             {
-                int major, minor, revision, patch;
-                Desktop.NativeMethods.GetFileVersion(dacFilename, out major, out minor, out revision, out patch);
+                NativeMethods.GetFileVersion(dacFilename, out int major, out int minor, out int revision, out int patch);
                 if (major != Version.Major || minor != Version.Minor || revision != Version.Revision || patch != Version.Patch)
                     throw new InvalidOperationException(string.Format("Mismatched dac. Version: {0}.{1}.{2}.{3}", major, minor, revision, patch));
             }
@@ -247,7 +200,7 @@ namespace Microsoft.Diagnostics.Runtime
             DacLibrary lib = new DacLibrary(_dataTarget, dac);
 
             Desktop.DesktopVersion ver;
-            if (Flavor == ClrFlavor.CoreCLR)
+            if (Flavor == ClrFlavor.Core)
             {
                 return new Desktop.V45Runtime(this, _dataTarget, lib);
             }
@@ -398,6 +351,51 @@ namespace Microsoft.Diagnostics.Runtime
             Guid = guid;
             Revision = rev;
         }
+
+        /// <summary>
+        /// GetHashCode implementation.
+        /// </summary>
+        /// <returns></returns>
+        public override int GetHashCode()
+        {
+            return Guid.GetHashCode() ^ Revision;
+        }
+
+        /// <summary>
+        /// Override for Equals.  Returns true if the guid, age, and filenames equal.  Note that this compares only the 
+        /// </summary>
+        /// <param name="obj"></param>
+        /// <returns>True if the objects match, false otherwise.</returns>
+        public override bool Equals(object obj)
+        {
+            if (obj == null)
+                return false;
+
+            if (ReferenceEquals(this, obj))
+                return true;
+
+            if (obj is PdbInfo rhs)
+            {
+
+                if (Revision == rhs.Revision && Guid == rhs.Guid)
+                {
+                    string lhsFilename = Path.GetFileName(FileName);
+                    string rhsFilename = Path.GetFileName(rhs.FileName);
+                    return lhsFilename.Equals(rhsFilename, StringComparison.OrdinalIgnoreCase);
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// To string implementation.
+        /// </summary>
+        /// <returns>Printing friendly version.</returns>
+        public override string ToString()
+        {
+            return $"{Guid} {Revision} {FileName}";
+        }
     }
 
     /// <summary>
@@ -489,8 +487,7 @@ namespace Microsoft.Diagnostics.Runtime
 
             if (_pdb != null && _managed != null)
                 return;
-
-            PdbInfo pdb = null;
+            
             PEFile file = null;
             try
             {
@@ -500,16 +497,14 @@ namespace Microsoft.Diagnostics.Runtime
 
                 _managed = file.Header.ComDescriptorDirectory.VirtualAddress != 0;
 
-                string pdbName;
-                Guid guid;
-                int age;
-                if (file.GetPdbSignature(out pdbName, out guid, out age))
+                if (file.GetPdbSignature(out string pdbName, out Guid guid, out int age))
                 {
-                    pdb = new PdbInfo();
-                    pdb.FileName = pdbName;
-                    pdb.Guid = guid;
-                    pdb.Revision = age;
-                    _pdb = pdb;
+                    _pdb = new PdbInfo()
+                    {
+                        FileName = pdbName,
+                        Guid = guid,
+                        Revision = age
+                    };
                 }
             }
             catch
@@ -585,8 +580,16 @@ namespace Microsoft.Diagnostics.Runtime
             if (flavor == ClrFlavor.Native)
                 return targetArchitecture == Runtime.Architecture.Amd64 ? "mrt100dac_winamd64.dll" : "mrt100dac_winx86.dll";
 
-            string dacName = flavor == ClrFlavor.CoreCLR ? "mscordaccore" : "mscordacwks";
+            string dacName = flavor == ClrFlavor.Core ? "mscordaccore" : "mscordacwks";
             return string.Format("{0}_{1}_{2}_{3}.{4}.{5}.{6:D2}.dll", dacName, currentArchitecture, targetArchitecture, clrVersion.Major, clrVersion.Minor, clrVersion.Revision, clrVersion.Patch);
+        }
+
+        internal static string GetDacFileName(ClrFlavor flavor, Runtime.Architecture targetArchitecture)
+        {
+            if (flavor == ClrFlavor.Native)
+                return targetArchitecture == Runtime.Architecture.Amd64 ? "mrt100dac_winamd64.dll" : "mrt100dac_winx86.dll";
+
+            return flavor == ClrFlavor.Core ? "mscordaccore.dll" : "mscordacwks.dll";
         }
 
         /// <summary>
@@ -638,85 +641,6 @@ namespace Microsoft.Diagnostics.Runtime
             BaseAddress = addr;
             Size = size;
         }
-    }
-
-    /// <summary>
-    /// The result of an asynchronous memory read.  This is returned by an IDataReader
-    /// when an async memory read is requested.
-    /// </summary>
-    [Obsolete]
-    public class AsyncMemoryReadResult
-    {
-        /// <summary>
-        /// A wait handle which is signaled when the read operation is complete.
-        /// Complete must be assigned a valid EventWaitHandle before this object is
-        /// returned by ReadMemoryAsync, and Complete must be signaled after the
-        /// request is completed.
-        /// </summary>
-        public virtual EventWaitHandle Complete { get; set; }
-
-        /// <summary>
-        /// The address to read from.  Address must be assigned to before this objct is
-        /// returned by ReadMemoryAsync.
-        /// </summary>
-        public virtual ulong Address { get; set; }
-
-        /// <summary>
-        /// The number of bytes requested in this async read.  BytesRequested must be
-        /// assigned to before this objct is returned by ReadMemoryAsync.
-        /// </summary>
-        public virtual int BytesRequested { get; set; }
-
-        /// <summary>
-        /// The actual number of bytes read out of the data target.  This must be
-        /// assigned to before Complete is signaled.
-        /// </summary>
-        public virtual int BytesRead { get { return _read; } set { _read = value; } }
-
-        /// <summary>
-        /// The result of the memory read.  This must be assigned to before Complete is
-        /// signaled.
-        /// </summary>
-        public virtual byte[] Result { get { return _result; } set { _result = value; } }
-
-        /// <summary>
-        /// Empty constructor, no properties/fields assigned.
-        /// </summary>
-        public AsyncMemoryReadResult()
-        {
-        }
-
-        /// <summary>
-        /// Constructor.  Assigns Address, BytesRequested, and Complete.  (Uses a ManualResetEvent
-        /// for Complete).
-        /// </summary>
-        /// <param name="addr">The address of the memory read.</param>
-        /// <param name="requested">The number of bytes requested.</param>
-        public AsyncMemoryReadResult(ulong addr, int requested)
-        {
-            Address = addr;
-            BytesRequested = requested;
-            Complete = new ManualResetEvent(false);
-        }
-
-        /// <summary>
-        /// To string.
-        /// </summary>
-        /// <returns>The memory range requested.</returns>
-        public override string ToString()
-        {
-            return string.Format("[{0:x}, {1:x}]", Address, Address + (uint)BytesRequested);
-        }
-
-        /// <summary>
-        /// The amount read, backing variable for BytesRead.
-        /// </summary>
-        protected volatile int _read;
-
-        /// <summary>
-        /// The actual data buffer, backing variable for Result.
-        /// </summary>
-        protected volatile byte[] _result;
     }
 
     /// <summary>
@@ -778,22 +702,7 @@ namespace Microsoft.Diagnostics.Runtime
         /// <param name="bytesRead">The number of bytes actually read out of the target process.</param>
         /// <returns>True if any bytes were read at all, false if the read failed (and no bytes were read).</returns>
         bool ReadMemory(ulong address, IntPtr buffer, int bytesRequested, out int bytesRead);
-
-        /// <summary>
-        /// Returns true if this data reader can read data out of the target process asynchronously.
-        /// </summary>
-        [Obsolete]
-        bool CanReadAsync { get; }
-
-        /// <summary>
-        /// Reads memory from the target process asynchronously.  Only called if CanReadAsync returns true.
-        /// </summary>
-        /// <param name="address">The address of memory to read.</param>
-        /// <param name="bytesRequested">The number of bytes to read.</param>
-        /// <returns>A data structure containing an event to wait for as well as a new byte array to read from.</returns>
-        [Obsolete]
-        AsyncMemoryReadResult ReadMemoryAsync(ulong address, int bytesRequested);
-
+        
         /// <summary>
         /// Returns true if the data target is a minidump (or otherwise may not contain full heap data).
         /// </summary>
@@ -936,7 +845,7 @@ namespace Microsoft.Diagnostics.Runtime
         /// </summary>
         /// <param name="client">The dbgeng IDebugClient object.  We will query interface on this for IDebugClient.</param>
         /// <returns>A DataTarget instance.</returns>
-        public static DataTarget CreateFromDebuggerInterface(Microsoft.Diagnostics.Runtime.Interop.IDebugClient client)
+        public static DataTarget CreateFromDebuggerInterface(IDebugClient client)
         {
             DbgEngDataReader reader = new DbgEngDataReader(client);
             DataTargetImpl dataTarget = new DataTargetImpl(reader, reader.DebuggerInterface);
@@ -964,7 +873,7 @@ namespace Microsoft.Diagnostics.Runtime
         /// <returns>A DataTarget instance.</returns>
         public static DataTarget AttachToProcess(int pid, uint msecTimeout, AttachFlag attachFlag)
         {
-            Microsoft.Diagnostics.Runtime.Interop.IDebugClient client = null;
+            IDebugClient client = null;
             IDataReader reader;
             if (attachFlag == AttachFlag.Passive)
             {
@@ -1005,7 +914,23 @@ namespace Microsoft.Diagnostics.Runtime
             }
         }
 
-        internal FileLoader FileLoader { get; } = new FileLoader();
+        /// <summary>
+        /// A symbol provider which loads PDBs on behalf of ClrMD.  This should be set so that when ClrMD needs to
+        /// resolve names which can only come from PDBs.  If this is not set, you may have a degraded experience.
+        /// </summary>
+        public ISymbolProvider SymbolProvider { get; set; }
+
+        FileLoader _fileLoader;
+        internal FileLoader FileLoader
+        {
+            get
+            {
+                if (_fileLoader == null)
+                    _fileLoader = new FileLoader(this);
+
+                return _fileLoader;
+            }
+        }
 
         /// <summary>
         /// Returns true if the target process is a minidump, or otherwise might have limited memory.  If IsMinidump
@@ -1013,46 +938,6 @@ namespace Microsoft.Diagnostics.Runtime
         /// the application/crash dump you are debugging.
         /// </summary>
         public abstract bool IsMinidump { get; }
-
-        /// <summary>
-        /// Sets the symbol path for ClrMD.
-        /// </summary>
-        /// <param name="path">This should be in the format that Windbg/dbgeng expects with the '.sympath' command.</param>
-        [Obsolete("Use SymbolLocator.SymbolPath instead.")]
-        public void SetSymbolPath(string path)
-        {
-            SymbolLocator.SymbolPath = path;
-        }
-
-        /// <summary>
-        /// Clears the symbol path.
-        /// </summary>
-        [Obsolete("Use SymbolLocator.SymbolPath instead.")]
-        public void ClearSymbolPath()
-        {
-            SymbolLocator.SymbolPath = "";
-        }
-
-        /// <summary>
-        /// Appends 'path' to the symbol path.
-        /// </summary>
-        /// <param name="path">The location to add.</param>
-        [Obsolete("Use SymbolLocator.SymbolPath instead.")]
-        public void AppendSymbolPath(string path)
-        {
-            string temp = SymbolLocator.SymbolPath + ";" + path;
-            SymbolLocator.SymbolPath = temp.Replace(";;", ";");
-        }
-
-        /// <summary>
-        /// Returns the current symbol path.
-        /// </summary>
-        /// <returns>The symbol path.</returns>
-        [Obsolete("Use SymbolLocator.SymbolPath instead.")]
-        public string GetSymbolPath()
-        {
-            return SymbolLocator.SymbolPath;
-        }
 
         /// <summary>
         /// Returns the architecture of the target process or crash dump.
@@ -1082,22 +967,10 @@ namespace Microsoft.Diagnostics.Runtime
         public abstract bool ReadProcessMemory(ulong address, byte[] buffer, int bytesRequested, out int bytesRead);
 
         /// <summary>
-        /// Creates a runtime from the given Dac file on disk.
-        /// </summary>
-        [Obsolete("Use ClrInfo.CreateRuntime() instead.")]
-        public abstract ClrRuntime CreateRuntime(string dacFileName);
-
-        /// <summary>
-        /// Creates a runtime from a given IXClrDataProcess interface.  Used for debugger plugins.
-        /// </summary>
-        [Obsolete("Use ClrInfo.CreateRuntime(object) instead.")]
-        public abstract ClrRuntime CreateRuntime(object clrDataProcess);
-
-        /// <summary>
         /// Returns the IDebugClient interface associated with this datatarget.  (Will return null if the
         /// user attached passively.)
         /// </summary>
-        public abstract Microsoft.Diagnostics.Runtime.Interop.IDebugClient DebuggerInterface { get; }
+        public abstract IDebugClient DebuggerInterface { get; }
 
         /// <summary>
         /// Enumerates information about the loaded modules in the process (both managed and unmanaged).
@@ -1110,53 +983,6 @@ namespace Microsoft.Diagnostics.Runtime
         public abstract void Dispose();
     }
 
-
-    /// <summary>
-    /// Interface for receiving callback notifications when downloading symbol files.
-    /// </summary>
-    [Obsolete]
-    public interface ISymbolNotification
-    {
-        /// <summary>
-        /// Symbol lookup was initiated, but found in a cache without needing to fetch it
-        /// from the symbol path.
-        /// </summary>
-        /// <param name="localPath">The location of the file on disk.</param>
-        void FoundSymbolInCache(string localPath);
-
-        /// <summary>
-        /// Called when attempting to resolve a location (either local or remote), but we did
-        /// not find the file.
-        /// </summary>
-        /// <param name="url">The path/url attempted.</param>
-        void ProbeFailed(string url);
-
-        /// <summary>
-        /// We found the symbol on the symbol path.
-        /// </summary>
-        /// <param name="url">Where we found the symbol from.</param>
-        void FoundSymbolOnPath(string url);
-
-        /// <summary>
-        /// Called periodically when downloading the symbol from the symbol server.
-        /// </summary>
-        /// <param name="bytesDownloaded">The total bytes downloaded thus far.</param>
-        void DownloadProgress(int bytesDownloaded);
-
-        /// <summary>
-        /// Called when the download is complete.
-        /// </summary>
-        /// <param name="localPath">Where the file was placed.</param>
-        /// <param name="requiresDecompression">True if the file requires us to decompress it (done automatically).</param>
-        void DownloadComplete(string localPath, bool requiresDecompression);
-
-        /// <summary>
-        /// Called when the file is finished decompressing.
-        /// </summary>
-        /// <param name="localPath">The location of the resulting decompressed file.</param>
-        void DecompressionComplete(string localPath);
-    }
-
     internal class DataTargetImpl : DataTarget
     {
         private IDataReader _dataReader;
@@ -1167,10 +993,7 @@ namespace Microsoft.Diagnostics.Runtime
 
         public DataTargetImpl(IDataReader dataReader, IDebugClient client)
         {
-            if (dataReader == null)
-                throw new ArgumentNullException("dataReader");
-
-            _dataReader = dataReader;
+            _dataReader = dataReader ?? throw new ArgumentNullException("dataReader");
             _client = client;
             _architecture = _dataReader.GetArchitecture();
         }
@@ -1213,10 +1036,6 @@ namespace Microsoft.Diagnostics.Runtime
                     if (clrName != "clr" && clrName != "mscorwks" && clrName != "coreclr" && clrName != "mrt100_app")
                         continue;
 
-                    string dacLocation = Path.Combine(Path.GetDirectoryName(module.FileName), "mscordacwks.dll");
-                    if (!File.Exists(dacLocation) || !NativeMethods.IsEqualFileVersion(module.FileName, module.Version))
-                        dacLocation = null;
-
                     ClrFlavor flavor;
                     switch (clrName)
                     {
@@ -1225,7 +1044,7 @@ namespace Microsoft.Diagnostics.Runtime
                             break;
 
                         case "coreclr":
-                            flavor = ClrFlavor.CoreCLR;
+                            flavor = ClrFlavor.Core;
                             break;
 
                         default:
@@ -1233,15 +1052,21 @@ namespace Microsoft.Diagnostics.Runtime
                             break;
                     }
 
+                    string dacLocation = Path.Combine(Path.GetDirectoryName(module.FileName), DacInfo.GetDacFileName(flavor, Architecture));
+                    if (!File.Exists(dacLocation) || !NativeMethods.IsEqualFileVersion(dacLocation, module.Version))
+                        dacLocation = null;
+
                     VersionInfo version = module.Version;
                     string dacAgnosticName = DacInfo.GetDacRequestFileName(flavor, Architecture, Architecture, version);
                     string dacFileName = DacInfo.GetDacRequestFileName(flavor, IntPtr.Size == 4 ? Architecture.X86 : Architecture.Amd64, Architecture, version);
 
-                    DacInfo dacInfo = new DacInfo(_dataReader, dacAgnosticName, Architecture);
-                    dacInfo.FileSize = module.FileSize;
-                    dacInfo.TimeStamp = module.TimeStamp;
-                    dacInfo.FileName = dacFileName;
-                    dacInfo.Version = module.Version;
+                    DacInfo dacInfo = new DacInfo(_dataReader, dacAgnosticName, Architecture)
+                    {
+                        FileSize = module.FileSize,
+                        TimeStamp = module.TimeStamp,
+                        FileName = dacFileName,
+                        Version = module.Version
+                    };
 
                     versions.Add(new ClrInfo(this, flavor, module, dacInfo, dacLocation));
                 }
@@ -1256,76 +1081,6 @@ namespace Microsoft.Diagnostics.Runtime
         public override bool ReadProcessMemory(ulong address, byte[] buffer, int bytesRequested, out int bytesRead)
         {
             return _dataReader.ReadMemory(address, buffer, bytesRequested, out bytesRead);
-        }
-
-        [Obsolete]
-        public override ClrRuntime CreateRuntime(string dacFilename)
-        {
-            if (IntPtr.Size != (int)_dataReader.GetPointerSize())
-                throw new InvalidOperationException("Mismatched architecture between this process and the dac.");
-
-            if (string.IsNullOrEmpty(dacFilename))
-                throw new ArgumentNullException("dacFilename");
-
-            if (!File.Exists(dacFilename))
-                throw new FileNotFoundException(dacFilename);
-
-            DacLibrary lib = new DacLibrary(this, dacFilename);
-
-            // TODO: There has to be a better way to determine this is coreclr.
-            string dacFileNoExt = Path.GetFileNameWithoutExtension(dacFilename).ToLower();
-            bool isCoreClr = dacFileNoExt.Contains("mscordaccore");
-            bool isNative = dacFileNoExt.Contains("mrt100dac");
-
-            int major, minor, revision, patch;
-            bool res = NativeMethods.GetFileVersion(dacFilename, out major, out minor, out revision, out patch);
-
-            DesktopVersion ver;
-            if (isCoreClr)
-            {
-                return new V45Runtime(null, this, lib);
-            }
-            else if (isNative)
-            {
-                return new Native.NativeRuntime(null, this, lib);
-            }
-            else if (major == 2)
-            {
-                ver = DesktopVersion.v2;
-            }
-            else if (major == 4 && minor == 0 && patch < 10000)
-            {
-                ver = DesktopVersion.v4;
-            }
-            else
-            {
-                // Assume future versions will all work on the newest runtime version.
-                return new V45Runtime(null, this, lib);
-            }
-
-            return new LegacyRuntime(null, this, lib, ver, patch);
-        }
-
-        [Obsolete]
-        public override ClrRuntime CreateRuntime(object clrDataProcess)
-        {
-            DacLibrary lib = new DacLibrary(this, (IXCLRDataProcess)clrDataProcess);
-
-            // Figure out what version we are on.
-            if (clrDataProcess is ISOSDac)
-            {
-                return new V45Runtime(null, this, lib);
-            }
-            else
-            {
-                byte[] buffer = new byte[Marshal.SizeOf(typeof(V2HeapDetails))];
-
-                int val = lib.DacInterface.Request(DacRequests.GCHEAPDETAILS_STATIC_DATA, 0, null, (uint)buffer.Length, buffer);
-                if ((uint)val == (uint)0x80070057)
-                    return new LegacyRuntime(null, this, lib, DesktopVersion.v4, 10000);
-                else
-                    return new LegacyRuntime(null, this, lib, DesktopVersion.v2, 3054);
-            }
         }
 
         public override IDebugClient DebuggerInterface
@@ -1375,10 +1130,13 @@ namespace Microsoft.Diagnostics.Runtime
     {
         #region Variables
         private IntPtr _library;
-        private IDacDataTarget _dacDataTarget;
+        private DacDataTarget _dacDataTarget;
         private IXCLRDataProcess _dac;
         private ISOSDac _sos;
+        private HashSet<object> _release = new HashSet<object>();
         #endregion
+
+        public DacDataTarget DacDataTarget { get { return _dacDataTarget; } }
 
         public IXCLRDataProcess DacInterface { get { return _dac; } }
 
@@ -1412,10 +1170,9 @@ namespace Microsoft.Diagnostics.Runtime
             IntPtr addr = NativeMethods.GetProcAddress(_library, "CLRDataCreateInstance");
             _dacDataTarget = new DacDataTarget(dataTarget);
 
-            object obj;
             NativeMethods.CreateDacInstance func = (NativeMethods.CreateDacInstance)Marshal.GetDelegateForFunctionPointer(addr, typeof(NativeMethods.CreateDacInstance));
             Guid guid = new Guid("5c552ab6-fc09-4cb3-8e36-22fa03c798b7");
-            int res = func(ref guid, _dacDataTarget, out obj);
+            int res = func(ref guid, _dacDataTarget, out object obj);
 
             if (res == 0)
                 _dac = obj as IXCLRDataProcess;
@@ -1426,12 +1183,24 @@ namespace Microsoft.Diagnostics.Runtime
 
         ~DacLibrary()
         {
+            foreach (object obj in _release)
+                Marshal.FinalReleaseComObject(obj);
+
+            if (_dac != null)
+                Marshal.FinalReleaseComObject(_dac);
+
             if (_library != IntPtr.Zero)
                 NativeMethods.FreeLibrary(_library);
         }
+
+        internal void AddToReleaseList(object obj)
+        {
+            Debug.Assert(Marshal.IsComObject(obj));
+            _release.Add(obj);
+        }
     }
 
-    internal class DacDataTarget : IDacDataTarget, IMetadataLocator
+    internal class DacDataTarget : IDacDataTarget, IMetadataLocator, ICorDebug.ICorDebugDataTarget
     {
         private DataTargetImpl _dataTarget;
         private IDataReader _dataReader;
@@ -1445,6 +1214,40 @@ namespace Microsoft.Diagnostics.Runtime
             Array.Sort(_modules, delegate (ModuleInfo a, ModuleInfo b) { return a.ImageBase.CompareTo(b.ImageBase); });
         }
 
+
+        public CorDebugPlatform GetPlatform()
+        {
+            var arch = _dataReader.GetArchitecture();
+
+            switch (arch)
+            {
+                case Architecture.Amd64:
+                    return CorDebugPlatform.CORDB_PLATFORM_WINDOWS_AMD64;
+
+                case Architecture.X86:
+                    return CorDebugPlatform.CORDB_PLATFORM_WINDOWS_X86;
+
+                case Architecture.Arm:
+                    return CorDebugPlatform.CORDB_PLATFORM_WINDOWS_ARM;
+
+                default:
+                    throw new Exception();
+            }
+        }
+
+        public uint ReadVirtual(ulong address, IntPtr buffer, uint bytesRequested)
+        {
+            if (ReadVirtual(address, buffer, (int)bytesRequested, out int read) >= 0)
+                return (uint)read;
+
+            throw new Exception();
+        }
+
+        void ICorDebugDataTarget.GetThreadContext(uint threadId, uint contextFlags, uint contextSize, IntPtr context)
+        {
+            if (!_dataReader.GetThreadContext(threadId, contextFlags, contextSize, context))
+                throw new Exception();
+        }
 
         public void GetMachineType(out IMAGE_FILE_MACHINE machineType)
         {
@@ -1514,8 +1317,7 @@ namespace Microsoft.Diagnostics.Runtime
 
         public unsafe int ReadVirtual(ulong address, IntPtr buffer, int bytesRequested, out int bytesRead)
         {
-            int read = 0;
-            if (_dataReader.ReadMemory(address, buffer, bytesRequested, out read))
+            if (_dataReader.ReadMemory(address, buffer, bytesRequested, out int read))
             {
                 bytesRead = read;
                 return 0;
@@ -1532,7 +1334,7 @@ namespace Microsoft.Diagnostics.Runtime
                 }
 
                 // We do not put a using statement here to prevent needing to load/unload the binary over and over.
-                PEFile file = _dataTarget.FileLoader.LoadBinary(filePath);
+                PEFile file = _dataTarget.FileLoader.LoadPEFile(filePath);
                 if (file != null)
                 {
                     PEBuffer peBuffer = file.AllocBuff();
@@ -1561,8 +1363,7 @@ namespace Microsoft.Diagnostics.Runtime
 
         public int ReadMemory(ulong address, byte[] buffer, uint bytesRequested, out uint bytesRead)
         {
-            int read = 0;
-            if (_dataReader.ReadMemory(address, buffer, (int)bytesRequested, out read))
+            if (_dataReader.ReadMemory(address, buffer, (int)bytesRequested, out int read))
             {
                 bytesRead = (uint)read;
                 return 0;
@@ -1621,7 +1422,7 @@ namespace Microsoft.Diagnostics.Runtime
                 return -1;
 
             // We do not put a using statement here to prevent needing to load/unload the binary over and over.
-            PEFile file = _dataTarget.FileLoader.LoadBinary(filePath);
+            PEFile file = _dataTarget.FileLoader.LoadPEFile(filePath);
             if (file == null)
                 return -1;
 
@@ -1760,16 +1561,13 @@ namespace Microsoft.Diagnostics.Runtime
 
                 SetClientInstance();
 
-                DEBUG_CLASS cls;
-                DEBUG_CLASS_QUALIFIER qual;
-                _control.GetDebuggeeType(out cls, out qual);
+                _control.GetDebuggeeType(out DEBUG_CLASS cls, out DEBUG_CLASS_QUALIFIER qual);
 
                 if (qual == DEBUG_CLASS_QUALIFIER.USER_WINDOWS_SMALL_DUMP)
                 {
-                    DEBUG_FORMAT flags;
-                    _control.GetDumpFormatFlags(out flags);
+                    _control.GetDumpFormatFlags(out DEBUG_FORMAT flags);
                     _minidump = (flags & DEBUG_FORMAT.USER_SMALL_FULL_MEMORY) == 0;
-                    return (bool)_minidump;
+                    return _minidump.Value;
                 }
 
                 _minidump = false;
@@ -1781,8 +1579,7 @@ namespace Microsoft.Diagnostics.Runtime
         {
             SetClientInstance();
 
-            IMAGE_FILE_MACHINE machineType;
-            int hr = _control.GetExecutingProcessorType(out machineType);
+            int hr = _control.GetExecutingProcessorType(out IMAGE_FILE_MACHINE machineType);
             if (0 != hr)
                 throw new ClrDiagnosticsException(String.Format("Failed to get proessor type, HRESULT: {0:x8}", hr), ClrDiagnosticsException.HR.DebuggerError);
 
@@ -1807,8 +1604,7 @@ namespace Microsoft.Diagnostics.Runtime
         private static IDebugClient CreateIDebugClient()
         {
             Guid guid = new Guid("27fe5639-8407-4f47-8364-ee118fb08ac8");
-            object obj;
-            NativeMethods.DebugCreate(ref guid, out obj);
+            NativeMethods.DebugCreate(ref guid, out object obj);
 
             IDebugClient client = (IDebugClient)obj;
             return client;
@@ -1844,8 +1640,7 @@ namespace Microsoft.Diagnostics.Runtime
 
         public bool GetThreadContext(uint threadID, uint contextFlags, uint contextSize, IntPtr context)
         {
-            uint id = 0;
-            GetThreadIdBySystemId(threadID, out id);
+            GetThreadIdBySystemId(threadID, out uint id);
 
             SetCurrentThreadId(id);
             GetThreadContext(context, contextSize);
@@ -1868,8 +1663,7 @@ namespace Microsoft.Diagnostics.Runtime
             if (buffer.Length < bytesRequested)
                 bytesRequested = buffer.Length;
 
-            uint read = 0;
-            int res = _spaces.ReadVirtual(address, buffer, (uint)bytesRequested, out read);
+            int res = _spaces.ReadVirtual(address, buffer, (uint)bytesRequested, out uint read);
             bytesRead = (int)read;
             return res;
         }
@@ -1877,16 +1671,13 @@ namespace Microsoft.Diagnostics.Runtime
 
         private ulong[] GetImageBases()
         {
-            List<ulong> bases = null;
-            uint count, unloadedCount;
-            if (GetNumberModules(out count, out unloadedCount) < 0)
+            if (GetNumberModules(out uint count, out uint unloadedCount) < 0)
                 return null;
 
-            bases = new List<ulong>((int)count);
+            List<ulong> bases = new List<ulong>((int)count);
             for (uint i = 0; i < count + unloadedCount; ++i)
             {
-                ulong image;
-                if (GetModuleByIndex(i, out image) < 0)
+                if (GetModuleByIndex(i, out ulong image) < 0)
                     continue;
 
                 bases.Add(image);
@@ -1911,14 +1702,15 @@ namespace Microsoft.Diagnostics.Runtime
                 {
                     for (int i = 0; i < bases.Length; ++i)
                     {
-                        ModuleInfo info = new ModuleInfo(this);
-                        info.TimeStamp = mods[i].TimeDateStamp;
-                        info.FileSize = mods[i].Size;
-                        info.ImageBase = bases[i];
+                        ModuleInfo info = new ModuleInfo(this)
+                        {
+                            TimeStamp = mods[i].TimeDateStamp,
+                            FileSize = mods[i].Size,
+                            ImageBase = bases[i]
+                        };
 
-                        uint needed;
                         StringBuilder sbpath = new StringBuilder();
-                        if (GetModuleNameString(DEBUG_MODNAME.IMAGE, i, bases[i], null, 0, out needed) >= 0 && needed > 1)
+                        if (GetModuleNameString(DEBUG_MODNAME.IMAGE, i, bases[i], null, 0, out uint needed) >= 0 && needed > 1)
                         {
                             sbpath.EnsureCapacity((int)needed);
                             if (GetModuleNameString(DEBUG_MODNAME.IMAGE, i, bases[i], sbpath, needed, out needed) >= 0)
@@ -2019,9 +1811,8 @@ namespace Microsoft.Diagnostics.Runtime
             if (_spaces2 == null)
                 return false;
 
-            MEMORY_BASIC_INFORMATION64 mem;
             SetClientInstance();
-            int hr = _spaces2.QueryVirtual(addr, out mem);
+            int hr = _spaces2.QueryVirtual(addr, out MEMORY_BASIC_INFORMATION64 mem);
             vq.BaseAddress = mem.BaseAddress;
             vq.Size = mem.RegionSize;
 
@@ -2037,8 +1828,7 @@ namespace Microsoft.Diagnostics.Runtime
 
         public ulong ReadPointerUnsafe(ulong addr)
         {
-            int read;
-            if (ReadVirtual(addr, _ptrBuffer, IntPtr.Size, out read) != 0)
+            if (ReadVirtual(addr, _ptrBuffer, IntPtr.Size, out int read) != 0)
                 return 0;
 
             fixed (byte* r = _ptrBuffer)
@@ -2052,8 +1842,7 @@ namespace Microsoft.Diagnostics.Runtime
 
         public uint ReadDwordUnsafe(ulong addr)
         {
-            int read;
-            if (ReadVirtual(addr, _ptrBuffer, 4, out read) != 0)
+            if (ReadVirtual(addr, _ptrBuffer, 4, out int read) != 0)
                 return 0;
 
             fixed (byte* r = _ptrBuffer)
@@ -2089,14 +1878,11 @@ namespace Microsoft.Diagnostics.Runtime
         {
             version = new VersionInfo();
 
-            uint index;
-            ulong baseAddr;
-            int hr = _symbols.GetModuleByOffset(addr, 0, out index, out baseAddr);
+            int hr = _symbols.GetModuleByOffset(addr, 0, out uint index, out ulong baseAddr);
             if (hr != 0)
                 return;
 
-            uint needed = 0;
-            hr = GetModuleVersionInformation(index, baseAddr, "\\", null, 0, out needed);
+            hr = GetModuleVersionInformation(index, baseAddr, "\\", null, 0, out uint needed);
             if (hr != 0)
                 return;
 
@@ -2165,8 +1951,7 @@ namespace Microsoft.Diagnostics.Runtime
         {
             SetClientInstance();
 
-            uint read;
-            bool res = _spacesPtr.ReadVirtual(address, buffer, (uint)bytesRequested, out read) >= 0;
+            bool res = _spacesPtr.ReadVirtual(address, buffer, (uint)bytesRequested, out uint read) >= 0;
             bytesRead = res ? (int)read : 0;
             return res;
         }
@@ -2181,8 +1966,7 @@ namespace Microsoft.Diagnostics.Runtime
         {
             SetClientInstance();
 
-            uint count = 0;
-            int hr = _systemObjects.GetNumberThreads(out count);
+            int hr = _systemObjects.GetNumberThreads(out uint count);
             if (hr == 0)
             {
                 uint[] sysIds = new uint[count];
@@ -2200,8 +1984,7 @@ namespace Microsoft.Diagnostics.Runtime
             SetClientInstance();
 
             ulong teb = 0;
-            uint id = 0;
-            int hr = _systemObjects.GetCurrentThreadId(out id);
+            int hr = _systemObjects.GetCurrentThreadId(out uint id);
             bool haveId = hr == 0;
 
             if (_systemObjects.GetThreadIdBySystemId(thread, out id) == 0 && _systemObjects.SetCurrentThreadId(id) == 0)
@@ -2244,26 +2027,11 @@ namespace Microsoft.Diagnostics.Runtime
                 s_needRelease = true;
         }
 
-        [Obsolete]
-        public bool CanReadAsync
-        {
-            get { return false; }
-        }
-
-        [Obsolete]
-        public AsyncMemoryReadResult ReadMemoryAsync(ulong address, int bytesRequested)
-        {
-            throw new NotImplementedException();
-        }
-
-
         public unsafe bool GetThreadContext(uint threadID, uint contextFlags, uint contextSize, byte[] context)
         {
-            uint id = 0;
-            GetThreadIdBySystemId(threadID, out id);
+            GetThreadIdBySystemId(threadID, out uint id);
 
             SetCurrentThreadId(id);
-
             fixed (byte* pContext = &context[0])
                 GetThreadContext(new IntPtr(pContext), contextSize);
 
@@ -2288,10 +2056,9 @@ namespace Microsoft.Diagnostics.Runtime
             if (_process == IntPtr.Zero)
                 throw new ClrDiagnosticsException(String.Format("Could not attach to process. Error {0}.", Marshal.GetLastWin32Error()));
 
-            bool wow64, targetWow64;
             using (Process p = Process.GetCurrentProcess())
-                if (NativeMethods.TryGetWow64(p.Handle, out wow64) &&
-                    NativeMethods.TryGetWow64(_process, out targetWow64) &&
+                if (NativeMethods.TryGetWow64(p.Handle, out bool wow64) &&
+                    NativeMethods.TryGetWow64(_process, out bool targetWow64) &&
                     wow64 != targetWow64)
                 {
                     throw new ClrDiagnosticsException("Dac architecture mismatch!");
@@ -2336,8 +2103,7 @@ namespace Microsoft.Diagnostics.Runtime
         {
             List<ModuleInfo> result = new List<ModuleInfo>();
 
-            uint needed;
-            EnumProcessModules(_process, null, 0, out needed);
+            EnumProcessModules(_process, null, 0, out uint needed);
 
             IntPtr[] modules = new IntPtr[needed / 4];
             uint size = (uint)modules.Length * sizeof(uint);
@@ -2357,17 +2123,18 @@ namespace Microsoft.Diagnostics.Runtime
                 StringBuilder sb = new StringBuilder(1024);
                 GetModuleFileNameExA(_process, ptr, sb, sb.Capacity);
 
+                ulong baseAddr = (ulong)ptr.ToInt64();
+                GetFileProperties(baseAddr, out uint filesize, out uint timestamp);
+
                 string filename = sb.ToString();
-                ModuleInfo module = new ModuleInfo(this);
+                ModuleInfo module = new ModuleInfo(this)
+                {
+                    ImageBase = baseAddr,
+                    FileName = filename,
+                    FileSize = filesize,
+                    TimeStamp = timestamp
+            };
 
-                module.ImageBase = (ulong)ptr.ToInt64();
-                module.FileName = filename;
-
-                uint filesize, timestamp;
-                GetFileProperties(module.ImageBase, out filesize, out timestamp);
-
-                module.FileSize = filesize;
-                module.TimeStamp = timestamp;
 
                 result.Add(module);
             }
@@ -2380,8 +2147,7 @@ namespace Microsoft.Diagnostics.Runtime
             StringBuilder filename = new StringBuilder(1024);
             GetModuleFileNameExA(_process, new IntPtr((long)addr), filename, filename.Capacity);
 
-            int major, minor, revision, patch;
-            if (NativeMethods.GetFileVersion(filename.ToString(), out major, out minor, out revision, out patch))
+            if (NativeMethods.GetFileVersion(filename.ToString(), out int major, out int minor, out int revision, out int patch))
                 version = new VersionInfo(major, minor, revision, patch);
             else
                 version = new VersionInfo();
@@ -2419,8 +2185,7 @@ namespace Microsoft.Diagnostics.Runtime
         private byte[] _ptrBuffer = new byte[IntPtr.Size];
         public ulong ReadPointerUnsafe(ulong addr)
         {
-            int read;
-            if (!ReadMemory(addr, _ptrBuffer, IntPtr.Size, out read))
+            if (!ReadMemory(addr, _ptrBuffer, IntPtr.Size, out int read))
                 return 0;
 
             fixed (byte* r = _ptrBuffer)
@@ -2435,8 +2200,7 @@ namespace Microsoft.Diagnostics.Runtime
 
         public uint ReadDwordUnsafe(ulong addr)
         {
-            int read;
-            if (!ReadMemory(addr, _ptrBuffer, 4, out read))
+            if (!ReadMemory(addr, _ptrBuffer, 4, out int read))
                 return 0;
 
             fixed (byte* r = _ptrBuffer)
@@ -2507,8 +2271,7 @@ namespace Microsoft.Diagnostics.Runtime
             timestamp = 0;
             byte[] buffer = new byte[4];
 
-            int read;
-            if (ReadMemory(moduleBase + 0x3c, buffer, buffer.Length, out read) && read == buffer.Length)
+            if (ReadMemory(moduleBase + 0x3c, buffer, buffer.Length, out int read) && read == buffer.Length)
             {
                 uint sigOffset = (uint)BitConverter.ToInt32(buffer, 0);
                 int sigLength = 4;
@@ -2584,21 +2347,7 @@ namespace Microsoft.Diagnostics.Runtime
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern SafeWin32Handle OpenThread(ThreadAccess dwDesiredAccess, [MarshalAs(UnmanagedType.Bool)] bool bInheritHandle, uint dwThreadId);
         #endregion
-
-        [Obsolete]
-        public bool CanReadAsync
-        {
-            //todo
-            get { return false; }
-        }
-
-        [Obsolete]
-        public AsyncMemoryReadResult ReadMemoryAsync(ulong address, int bytesRequested)
-        {
-            throw new NotImplementedException();
-        }
-
-
+        
         private enum ThreadAccess : int
         {
             THREAD_ALL_ACCESS = (0x1F03FF),

@@ -4,19 +4,22 @@
 using Microsoft.Diagnostics.Runtime.Desktop;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
 using System.Runtime.InteropServices;
-using Address = System.UInt64;
 
 namespace Microsoft.Diagnostics.Runtime.Native
 {
     internal class NativeRuntime : RuntimeBase
     {
         private ISOSNative _sos;
-        private NativeHeap _heap;
+        private Lazy<NativeHeap> _heap;
         private ClrThread[] _threads;
         private NativeModule[] _modules;
         private NativeAppDomain _domain;
         private int _dacRawVersion;
+
+        private ISOSNativeSerializedExceptionSupport _sosNativeSerializedExceptionSupport;
 
         public NativeRuntime(ClrInfo info, DataTargetImpl dt, DacLibrary lib)
             : base(info, dt, lib)
@@ -29,6 +32,13 @@ namespace Microsoft.Diagnostics.Runtime.Native
             _dacRawVersion = BitConverter.ToInt32(tmp, 0);
             if (_dacRawVersion != 10 && _dacRawVersion != 11)
                 throw new ClrDiagnosticsException("Unsupported dac version.", ClrDiagnosticsException.HR.DacError);
+
+            _heap = new Lazy<NativeHeap>(() => new NativeHeap(this, NativeModules));
+        }
+
+        public override ClrMethod GetMethodByHandle(ulong methodHandle)
+        {
+            return null;
         }
 
         protected override void InitApi()
@@ -41,25 +51,14 @@ namespace Microsoft.Diagnostics.Runtime.Native
 
                 _sos = (ISOSNative)dac;
             }
+
+            _sosNativeSerializedExceptionSupport = _library.DacInterface as ISOSNativeSerializedExceptionSupport;
         }
 
-        public override ClrHeap GetHeap()
-        {
-            if (_heap == null)
-                _heap = new NativeHeap(this, NativeModules, null);
+        public override ClrHeap Heap => _heap.Value;
 
-            return _heap;
-        }
-
-        public override ClrHeap GetHeap(System.IO.TextWriter log)
-        {
-            if (_heap == null)
-                _heap = new NativeHeap(this, NativeModules, log);
-            else
-                _heap.Log = log;
-
-            return _heap;
-        }
+        [Obsolete]
+        public override ClrHeap GetHeap() => _heap.Value;
 
         public override int PointerSize
         {
@@ -121,17 +120,14 @@ namespace Microsoft.Diagnostics.Runtime.Native
             OnRuntimeFlushed();
             throw new NotImplementedException();
         }
-
-        internal override IEnumerable<ClrStackFrame> EnumerateStackFrames(uint osThreadId)
-        {
-            throw new NotImplementedException();
-        }
+        
+        [Obsolete]
         override public ClrThreadPool GetThreadPool() { throw new NotImplementedException(); }
 
         internal ClrAppDomain GetRhAppDomain()
         {
             if (_domain == null)
-                _domain = new NativeAppDomain(NativeModules);
+                _domain = new NativeAppDomain(this, NativeModules);
 
             return _domain;
         }
@@ -146,14 +142,13 @@ namespace Microsoft.Diagnostics.Runtime.Native
                 List<ModuleInfo> modules = new List<ModuleInfo>(DataTarget.EnumerateModules());
                 modules.Sort((x, y) => x.ImageBase.CompareTo(y.ImageBase));
 
-                int count;
-                if (_sos.GetModuleList(0, null, out count) < 0)
+                if (_sos.GetModuleList(0, null, out int count) < 0)
                 {
                     _modules = ConvertModuleList(modules);
                     return _modules;
                 }
 
-                Address[] ptrs = new Address[count];
+                ulong[] ptrs = new ulong[count];
                 if (_sos.GetModuleList(count, ptrs, out count) < 0)
                 {
                     _modules = ConvertModuleList(modules);
@@ -216,7 +211,7 @@ namespace Microsoft.Diagnostics.Runtime.Native
             byte[] context = new byte[contextSize];
             _dataReader.GetThreadContext(thread.OSThreadId, 0, (uint)contextSize, context);
 
-            var walker = new NativeStackRootWalker(GetHeap(), GetRhAppDomain(), thread);
+            var walker = new NativeStackRootWalker(_heap.Value, GetRhAppDomain(), thread);
             THREADROOTCALLBACK del = new THREADROOTCALLBACK(walker.Callback);
             IntPtr callback = Marshal.GetFunctionPointerForDelegate(del);
 
@@ -261,7 +256,7 @@ namespace Microsoft.Diagnostics.Runtime.Native
             IThreadData thread = GetThread(tsData.FirstThread);
             for (int i = 0; thread != null; i++)
             {
-                threads.Add(new DesktopThread(this, thread, addr, tsData.Finalizer == addr));
+                threads.Add(new NativeThread(this, thread, addr, tsData.Finalizer == addr));
 
                 addr = thread.Next;
                 thread = GetThread(addr);
@@ -270,9 +265,97 @@ namespace Microsoft.Diagnostics.Runtime.Native
             _threads = threads.ToArray();
         }
 
+        public override IEnumerable<ClrException> EnumerateSerializedExceptions()
+        {
+            if (_sosNativeSerializedExceptionSupport == null)
+            {
+                return new ClrException[0];
+            }
+
+            var exceptionById = new Dictionary<ulong, NativeException>();
+            ISerializedExceptionEnumerator serializedExceptionEnumerator = _sosNativeSerializedExceptionSupport.GetSerializedExceptions();
+            while (serializedExceptionEnumerator.HasNext())
+            {
+                ISerializedException serializedException = serializedExceptionEnumerator.Next();
+
+                //build the stack frames
+                IList<ClrStackFrame> stackFrames = new List<ClrStackFrame>();
+                ISerializedStackFrameEnumerator serializedStackFrameEnumerator = serializedException.StackFrames;
+                while (serializedStackFrameEnumerator.HasNext())
+                {
+                    ISerializedStackFrame serializedStackFrame = serializedStackFrameEnumerator.Next();
+
+                    NativeModule nativeModule = _heap.Value.GetModuleFromAddress(serializedStackFrame.IP);
+                    string symbolName = null;
+                    if (nativeModule != null)
+                    {
+                        if (nativeModule.Pdb != null)
+                        {
+                            try
+                            {
+                                ISymbolResolver resolver = this.DataTarget.SymbolProvider.GetSymbolResolver(nativeModule.Pdb.FileName, nativeModule.Pdb.Guid, nativeModule.Pdb.Revision);
+
+                                if (resolver != null)
+                                {
+                                    symbolName = resolver.GetSymbolNameByRVA((uint)(serializedStackFrame.IP - nativeModule.ImageBase));
+                                }
+                                else
+                                {
+                                    Trace.WriteLine($"Unable to find symbol resolver for PDB [Filename:{nativeModule.Pdb.FileName}, GUID:{nativeModule.Pdb.Guid}, Revision:{nativeModule.Pdb.Revision}]");
+                                }
+                            }
+                            catch (Exception e)
+                            {
+                                Trace.WriteLine($"Error in finding the symbol resolver for PDB [Filename:{nativeModule.Pdb.FileName}, GUID:{nativeModule.Pdb.Guid}, Revision:{nativeModule.Pdb.Revision}]: {e.Message}");
+                                Trace.WriteLine("Check previous traces for additional information");
+                            }
+                        }
+                        else
+                        {
+                            Trace.WriteLine(String.Format("PDB not found for IP {0}, Module={1}", serializedStackFrame.IP, nativeModule.Name));
+                        }
+                    }
+                    else
+                    {
+                        Trace.WriteLine(String.Format("Unable to resolve module for IP {0}", serializedStackFrame.IP));
+                    }
+
+                    stackFrames.Add(new NativeHeap.NativeStackFrame(serializedStackFrame.IP, symbolName, nativeModule));
+                }
+
+                //create a new exception and populate the fields
+
+                exceptionById.Add(serializedException.ExceptionId, new NativeException(
+                    _heap.Value.GetTypeByMethodTable(serializedException.ExceptionEEType),
+                    serializedException.ExceptionCCWPtr,
+                    serializedException.HResult,
+                    serializedException.ThreadId,
+                    serializedException.ExceptionId,
+                    serializedException.InnerExceptionId,
+                    serializedException.NestingLevel,
+                    stackFrames));
+            }
+
+            var usedAsInnerException = new HashSet<ulong>();
+
+            foreach (var nativeException in exceptionById.Values)
+            {
+                if (nativeException.InnerExceptionId > 0)
+                {
+                    if (exceptionById.TryGetValue(nativeException.InnerExceptionId, out NativeException innerException))
+                    {
+                        nativeException.SetInnerException(innerException);
+                        usedAsInnerException.Add(innerException.ExceptionId);
+                    }
+                }
+            }
+
+            return exceptionById.Keys.Except(usedAsInnerException).Select(id => exceptionById[id]).Cast<ClrException>().ToList();
+        }
+
         #region Native Implementation
 
-        internal override ClrAppDomain GetAppDomainByAddress(Address addr)
+        internal override ClrAppDomain GetAppDomainByAddress(ulong addr)
         {
             return _domain;
         }
@@ -290,8 +373,7 @@ namespace Microsoft.Diagnostics.Runtime.Native
             if (addr == 0)
                 return null;
 
-            NativeThreadData data;
-            if (_sos.GetThreadData(addr, out data) < 0)
+            if (_sos.GetThreadData(addr, out NativeThreadData data) < 0)
                 return null;
 
             return data;
@@ -299,8 +381,7 @@ namespace Microsoft.Diagnostics.Runtime.Native
 
         internal override IHeapDetails GetSvrHeapDetails(ulong addr)
         {
-            NativeHeapDetails data;
-            if (_sos.GetGCHeapDetails(addr, out data) < 0)
+            if (_sos.GetGCHeapDetails(addr, out NativeHeapDetails data) < 0)
                 return null;
 
             return data;
@@ -308,8 +389,7 @@ namespace Microsoft.Diagnostics.Runtime.Native
 
         internal override IHeapDetails GetWksHeapDetails()
         {
-            NativeHeapDetails data;
-            if (_sos.GetGCHeapStaticData(out data) < 0)
+            if (_sos.GetGCHeapStaticData(out NativeHeapDetails data) < 0)
                 return null;
 
             return data;
@@ -317,8 +397,7 @@ namespace Microsoft.Diagnostics.Runtime.Native
 
         internal override ulong[] GetServerHeapList()
         {
-            int count = 0;
-            if (_sos.GetGCHeapList(0, null, out count) < 0)
+            if (_sos.GetGCHeapList(0, null, out int count) < 0)
                 return null;
 
             ulong[] items = new ulong[count];
@@ -330,8 +409,7 @@ namespace Microsoft.Diagnostics.Runtime.Native
 
         internal override IThreadStoreData GetThreadStoreData()
         {
-            NativeThreadStoreData data;
-            if (_sos.GetThreadStoreData(out data) < 0)
+            if (_sos.GetThreadStoreData(out NativeThreadStoreData data) < 0)
                 return null;
 
             return data;
@@ -342,8 +420,7 @@ namespace Microsoft.Diagnostics.Runtime.Native
             if (addr == 0)
                 return null;
 
-            NativeSegementData data;
-            if (_sos.GetGCHeapSegment(addr, out data) < 0)
+            if (_sos.GetGCHeapSegment(addr, out NativeSegementData data) < 0)
                 return null;
 
             return data;
@@ -351,8 +428,7 @@ namespace Microsoft.Diagnostics.Runtime.Native
 
         internal override IMethodTableData GetMethodTableData(ulong eetype)
         {
-            NativeMethodTableData data;
-            if (_sos.GetEETypeData(eetype, out data) < 0)
+            if (_sos.GetEETypeData(eetype, out NativeMethodTableData data) < 0)
                 return null;
 
             return data;
@@ -363,8 +439,7 @@ namespace Microsoft.Diagnostics.Runtime.Native
             // Can't return 0 on error here, as that would make values of 0 look like a
             // valid method table.  Instead, return something that won't likely be the value
             // in the methodtable.
-            ulong free;
-            if (_sos.GetFreeEEType(out free) < 0)
+            if (_sos.GetFreeEEType(out ulong free) < 0)
                 return ulong.MaxValue - 42;
 
             return free;
@@ -372,8 +447,7 @@ namespace Microsoft.Diagnostics.Runtime.Native
 
         internal override IGCInfo GetGCInfo()
         {
-            LegacyGCInfo info;
-            if (_sos.GetGCHeapData(out info) < 0)
+            if (_sos.GetGCHeapData(out LegacyGCInfo info) < 0)
                 return null;
 
             return info;
@@ -395,12 +469,15 @@ namespace Microsoft.Diagnostics.Runtime.Native
             throw new NotImplementedException();
         }
 
-        public override IEnumerable<ClrModule> EnumerateModules()
+        public override IList<ClrModule> Modules
         {
-            throw new NotImplementedException();
+            get
+            {
+                throw new NotImplementedException();
+            }
         }
 
-        public override CcwData GetCcwDataFromAddress(Address addr)
+        public override CcwData GetCcwDataByAddress(ulong addr)
         {
             throw new NotImplementedException();
         }

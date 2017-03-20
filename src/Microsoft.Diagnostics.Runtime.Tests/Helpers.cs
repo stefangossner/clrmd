@@ -1,20 +1,67 @@
 ﻿
 using System;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
-using Microsoft.Diagnostics.Runtime.Utilities;
 using System.IO;
 using System.Diagnostics;
 using System.Linq;
-using System.Runtime.InteropServices;
-using Microsoft.CSharp;
-using System.CodeDom.Compiler;
 using System.Collections.Generic;
-using Microsoft.Diagnostics.Runtime.Interop;
 
 namespace Microsoft.Diagnostics.Runtime.Tests
 {
-    static class Helpers
+    public static class Helpers
     {
+        public static IEnumerable<ulong> GetObjectsOfType(this ClrHeap heap, string name)
+        {
+            return from obj in heap.EnumerateObjectAddresses()
+                   let type = heap.GetObjectType(obj)
+                   where type?.Name?.Contains(name) ?? false
+                   select obj;
+        }
+        public static ulong GetStaticObjectValue(this ClrType mainType, string fieldName)
+        {
+            ClrStaticField field = mainType.GetStaticFieldByName(fieldName);
+            ulong obj = (ulong)field.GetValue(field.Type.Heap.Runtime.AppDomains.Single());
+            return obj;
+        }
+
+        public static ClrModule GetMainModule(this ClrRuntime runtime)
+        {
+            return runtime.Modules.Single(m => m.FileName.EndsWith(".exe"));
+        }
+
+        public static ClrMethod GetMethod(this ClrType type, string name)
+        {
+            return GetMethods(type, name).Single();
+        }
+
+        public static IEnumerable<ClrMethod> GetMethods(this ClrType type, string name)
+        {
+            return type.Methods.Where(m => m.Name == name);
+        }
+
+        public static HashSet<T> Unique<T>(this IEnumerable<T> self)
+        {
+            HashSet<T> set = new HashSet<T>();
+            foreach (T t in self)
+                set.Add(t);
+
+            return set;
+        }
+
+        public static ClrAppDomain GetDomainByName(this ClrRuntime runtime, string domainName)
+        {
+            return runtime.AppDomains.Where(ad => ad.Name == domainName).Single();
+        }
+
+        public static ClrModule GetModule(this ClrRuntime runtime, string filename)
+        {
+            return (from module in runtime.Modules
+                    let file = Path.GetFileName(module.FileName)
+                    where file.Equals(filename, StringComparison.OrdinalIgnoreCase)
+                    select module).Single();
+        }
+
+
         public static ClrThread GetMainThread(this ClrRuntime runtime)
         {
             ClrThread thread = runtime.Threads.Where(t => !t.IsFinalizer).Single();
@@ -26,9 +73,10 @@ namespace Microsoft.Diagnostics.Runtime.Tests
             return thread.StackTrace.Where(sf => sf.Method != null ? sf.Method.Name == functionName : false).Single();
         }
 
-        public static string TestWorkingDirectory { get { return _workingPath.Value; } }
+        public static string TestWorkingDirectory { get { return _userSetWorkingPath ?? _workingPath.Value; } set { Debug.Assert(!_workingPath.IsValueCreated); _userSetWorkingPath = value; } }
 
         #region Working Path Helpers
+        static string _userSetWorkingPath = null;
         static Lazy<string> _workingPath = new Lazy<string>(() => CreateWorkingPath(), true);
         private static string CreateWorkingPath()
         {

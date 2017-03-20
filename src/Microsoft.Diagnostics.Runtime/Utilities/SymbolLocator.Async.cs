@@ -201,8 +201,7 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
         {
             lock (tasks)
             {
-                Task<string> tmp;
-                if (tasks.TryGetValue(fileEntry, out tmp) && tmp == task)
+                if (tasks.TryGetValue(fileEntry, out Task<string> tmp) && tmp == task)
                     tasks.Remove(fileEntry);
 
                 lock (missingFiles)
@@ -316,7 +315,10 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
 
             // First, check for the compressed location.  This is the one we really want to download.
             string compressedFilePath = fileIndexPath.Substring(0, fileIndexPath.Length - 1) + "_";
-            Task<string> compressedFilePathDownload = GetPhysicalFileFromServerAsync(urlForServer, compressedFilePath, Path.Combine(cache, compressedFilePath));
+            string compressedFileTarget = Path.Combine(cache, compressedFilePath);
+
+            TryDeleteFile(compressedFileTarget);
+            Task<string> compressedFilePathDownload = GetPhysicalFileFromServerAsync(urlForServer, compressedFilePath, compressedFileTarget);
 
             // Second, check if the raw file itself is indexed, uncompressed.
             Task<string> rawFileDownload = GetPhysicalFileFromServerAsync(urlForServer, fileIndexPath, fullDestPath);
@@ -334,6 +336,7 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
                 {
                     // Decompress it
                     Command.Run("Expand " + Command.Quote(result) + " " + Command.Quote(fullDestPath));
+                    Trace($"Found '{Path.GetFileName(fileIndexPath)}' on server '{urlForServer}'.  Copied to '{fullDestPath}'.");
                     return fullDestPath;
                 }
                 catch (Exception e)
@@ -350,7 +353,10 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
             // Handle uncompressed download.
             result = await rawFileDownload;
             if (result != null)
+            {
+                Trace($"Found '{Path.GetFileName(fileIndexPath)}' on server '{urlForServer}'.  Copied to '{result}'.");
                 return result;
+            }
 
             // Handle redirection case.
             var filePtrData = (await filePtrDownload ?? "").Trim();
@@ -364,6 +370,7 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
                     using (FileStream input = File.OpenRead(filePtrData))
                         await CopyStreamToFileAsync(input, filePtrSigPath, fullDestPath, input.Length);
 
+                    Trace($"Found '{Path.GetFileName(fileIndexPath)}' on server '{urlForServer}'.  Copied to '{fullDestPath}'.");
                     return fullDestPath;
                 }
                 catch (Exception)
@@ -376,7 +383,23 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
                 Trace("Error resolving file.ptr: content '{0}' from '{1}'.", filePtrData, filePtrSigPath);
             }
 
+            Trace($"No file matching '{Path.GetFileName(fileIndexPath)}' found on server '{urlForServer}'.");
             return null;
+        }
+
+        private void TryDeleteFile(string file)
+        {
+            if (File.Exists(file))
+            {
+                try
+                {
+                    File.Delete(file);
+                }
+                catch
+                {
+                    // Ignore failure here.
+                }
+            }
         }
 
         private async Task<string> GetPhysicalFileFromServerAsync(string serverPath, string fileIndexPath, string fullDestPath, bool returnContents = false)
@@ -479,7 +502,8 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
         /// <returns>A task indicating when the copy is completed.</returns>
         protected override void CopyStreamToFile(Stream stream, string fullSrcPath, string fullDestPath, long size)
         {
-            CopyStreamToFileAsync(stream, fullSrcPath, fullDestPath, size).Wait();
+            var task = Task.Run(async () => { await CopyStreamToFileAsync(stream, fullSrcPath, fullDestPath, size); });
+            task.Wait();
         }
 
         /// <summary>
@@ -532,8 +556,7 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
         {
             lock (s_files)
             {
-                Task<string> task;
-                if (s_files.TryGetValue(entry, out task))
+                if (s_files.TryGetValue(entry, out Task<string> task))
                     return task.Result;
             }
 
@@ -566,8 +589,7 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
         {
             lock (s_pdbs)
             {
-                Task<string> task;
-                if (s_pdbs.TryGetValue(entry, out task))
+                if (s_pdbs.TryGetValue(entry, out Task<string> task))
                     return task.Result;
             }
 
@@ -597,7 +619,18 @@ namespace Microsoft.Diagnostics.Runtime.Utilities
 
         internal override void PrefetchBinary(string name, int timestamp, int imagesize)
         {
-            new Task(async () => await FindBinaryAsync(name, timestamp, imagesize, true)).Start();
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(name))
+                    new Task(async () => await FindBinaryAsync(name, timestamp, imagesize, true)).Start();
+            }
+            catch (Exception e)
+            {
+                // Background fetching binaries should never cause an exception that will tear down the process
+                // (which would be the case since this is done on a background worker thread with no one around
+                // to handle it).  We will swallow all exceptions here, but fail in debug builds.
+                Debug.Fail(e.ToString());
+            }
         }
     }
 
